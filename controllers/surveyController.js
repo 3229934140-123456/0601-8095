@@ -1,5 +1,10 @@
 const { Survey, SURVEY_STATUS } = require('../models/Survey');
 const ValidationService = require('../services/validationService');
+const crypto = require('crypto');
+
+const getBaseUrl = (req) => {
+  return `${req.protocol}://${req.get('host')}`;
+};
 
 exports.createSurvey = async (req, res, next) => {
   try {
@@ -103,6 +108,81 @@ exports.getSurvey = async (req, res, next) => {
     if (req.user && req.user.id === survey.createdBy) {
       responseData.history = survey.history;
     }
+    
+    const isOwner = req.user && req.user.id === survey.createdBy;
+    responseData.entryStatus = survey.getFillEntryStatus(
+      survey.settings?.accessMode === 'login_required' ? req.user : null
+    );
+    
+    if (isOwner || req.user?.role === 'admin') {
+      responseData.fillEntry = survey.getFillEntryInfo(getBaseUrl(req));
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        survey: responseData
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getFillEntry = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.query;
+    
+    const survey = await Survey.findOne({ id }).select('id title description status version questions settings antiDuplicate responseCount');
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    const currentUser = survey.settings?.accessMode === 'login_required' ? req.user : null;
+    const entryStatus = survey.getFillEntryStatus(currentUser);
+    
+    if (survey.settings?.accessPassword) {
+      const hashedPassword = crypto.createHash('sha256').update(String(password || '')).digest('hex');
+      if (hashedPassword !== survey.settings.accessPassword) {
+        entryStatus.canFill = false;
+        entryStatus.reasons.push('需要访问密码');
+        entryStatus.details.requirePassword = true;
+      }
+    }
+    
+    const responseData = {
+      id: survey.id,
+      title: survey.title,
+      description: survey.description,
+      version: survey.version,
+      questions: entryStatus.canFill ? survey.questions : undefined,
+      settings: {
+        showProgress: survey.settings?.showProgress !== false,
+        shuffleQuestions: survey.settings?.shuffleQuestions === true,
+        welcomeMessage: survey.settings?.welcomeMessage,
+        thankYouMessage: survey.settings?.thankYouMessage,
+        redirectUrl: survey.settings?.redirectUrl
+      },
+      antiDuplicate: {
+        mode: survey.antiDuplicate?.mode
+      },
+      entryStatus,
+      fillEntry: {
+        configuration: {
+          accessMode: survey.settings?.accessMode || 'public',
+          requireLogin: survey.settings?.accessMode === 'login_required',
+          requirePassword: !!survey.settings?.accessPassword,
+          startTime: survey.settings?.startTime,
+          endTime: survey.settings?.endTime,
+          allowAnonymous: survey.settings?.allowAnonymous !== false
+        }
+      }
+    };
     
     res.json({
       success: true,
@@ -268,14 +348,21 @@ exports.updateSurveyStatus = async (req, res, next) => {
     survey.status = status;
     await survey.save();
     
+    const responseData = {
+      id: survey.id,
+      status: survey.status
+    };
+    
+    if (status === SURVEY_STATUS.PUBLISHED) {
+      responseData.entryStatus = survey.getFillEntryStatus();
+      responseData.fillEntry = survey.getFillEntryInfo(getBaseUrl(req));
+    }
+    
     res.json({
       success: true,
       message: `问卷状态已更新为 ${status}`,
       data: {
-        survey: {
-          id: survey.id,
-          status: survey.status
-        }
+        survey: responseData
       }
     });
   } catch (err) {

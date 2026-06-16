@@ -89,48 +89,54 @@ responseSchema.statics.generateAntiDuplicateKeys = function(surveyId, respondent
     return crypto.createHash('sha256').update(parts.join('|')).digest('hex');
   };
   
+  const addKeyIfPresent = (keyMode, ...keyParts) => {
+    if (keyParts.every(p => p !== null && p !== undefined && String(p).trim() !== '')) {
+      const key = makeKey(keyMode, surveyId, String(expiryBucket), ...keyParts);
+      if (!keys.some(k => k.mode === keyMode && k.key === key)) {
+        keys.push({ mode: keyMode, key });
+      }
+    }
+  };
+  
   switch (mode) {
     case 'by_user':
-      if (respondent.userId) {
-        const key = makeKey('by_user', surveyId, String(expiryBucket), respondent.userId);
-        keys.push({ mode: 'by_user', key });
+      addKeyIfPresent('by_user', respondent.userId);
+      addKeyIfPresent('by_ip', respondent.ipAddress);
+      if (respondent.deviceId || respondent.fingerprint) {
+        addKeyIfPresent('by_device_fp', respondent.deviceId || '', respondent.fingerprint || '');
       }
       break;
       
     case 'by_ip':
-      if (respondent.ipAddress) {
-        const key = makeKey('by_ip', surveyId, String(expiryBucket), respondent.ipAddress);
-        keys.push({ mode: 'by_ip', key });
+      addKeyIfPresent('by_ip', respondent.ipAddress);
+      if (respondent.deviceId) {
+        addKeyIfPresent('by_device', respondent.deviceId);
+      }
+      if (respondent.fingerprint) {
+        addKeyIfPresent('by_fp', respondent.fingerprint);
       }
       break;
       
     case 'by_device':
-      if (respondent.deviceId) {
-        const key = makeKey('by_device', surveyId, String(expiryBucket), respondent.deviceId);
-        keys.push({ mode: 'by_device', key });
-      }
-      if (respondent.fingerprint) {
-        const key = makeKey('by_fp', surveyId, String(expiryBucket), respondent.fingerprint);
-        keys.push({ mode: 'by_fp', key });
+      addKeyIfPresent('by_device', respondent.deviceId);
+      addKeyIfPresent('by_fp', respondent.fingerprint);
+      if (!respondent.deviceId && !respondent.fingerprint) {
+        addKeyIfPresent('by_ip', respondent.ipAddress);
+      } else if (!respondent.deviceId || !respondent.fingerprint) {
+        addKeyIfPresent('by_ip', respondent.ipAddress);
       }
       break;
       
     case 'by_user_ip_device':
-      if (respondent.userId) {
-        const key = makeKey('by_user', surveyId, String(expiryBucket), respondent.userId);
-        keys.push({ mode: 'by_user', key });
+      addKeyIfPresent('by_user', respondent.userId);
+      addKeyIfPresent('by_ip', respondent.ipAddress);
+      addKeyIfPresent('by_device', respondent.deviceId);
+      addKeyIfPresent('by_fp', respondent.fingerprint);
+      if (respondent.userId && respondent.ipAddress) {
+        addKeyIfPresent('by_user_ip', respondent.userId, respondent.ipAddress);
       }
-      if (respondent.ipAddress) {
-        const key = makeKey('by_ip', surveyId, String(expiryBucket), respondent.ipAddress);
-        keys.push({ mode: 'by_ip', key });
-      }
-      if (respondent.deviceId) {
-        const key = makeKey('by_device', surveyId, String(expiryBucket), respondent.deviceId);
-        keys.push({ mode: 'by_device', key });
-      }
-      if (respondent.fingerprint) {
-        const key = makeKey('by_fp', surveyId, String(expiryBucket), respondent.fingerprint);
-        keys.push({ mode: 'by_fp', key });
+      if (respondent.userId && (respondent.deviceId || respondent.fingerprint)) {
+        addKeyIfPresent('by_user_device', respondent.userId, respondent.deviceId || '', respondent.fingerprint || '');
       }
       break;
       
@@ -243,6 +249,69 @@ responseSchema.statics.createWithAntiDuplicate = async function(responseData, su
     }
     throw err;
   }
+};
+
+responseSchema.statics.buildFilterQuery = function(surveyId, filters = {}) {
+  const query = { surveyId };
+  
+  if (filters.version !== undefined && filters.version !== null && filters.version !== '') {
+    query.surveyVersion = Number(filters.version);
+  }
+  
+  if (filters.userId) {
+    query['respondent.userId'] = filters.userId;
+  }
+  
+  if (filters.ipAddress) {
+    query['respondent.ipAddress'] = { $regex: new RegExp(`^${filters.ipAddress.replace(/\./g, '\\.')}`, 'i') };
+  }
+  
+  if (filters.deviceId) {
+    query['respondent.deviceId'] = { $regex: new RegExp(filters.deviceId, 'i') };
+  }
+  
+  if (filters.fingerprint) {
+    query['respondent.fingerprint'] = { $regex: new RegExp(filters.fingerprint, 'i') };
+  }
+  
+  if (filters.startDate || filters.endDate) {
+    query.createdAt = {};
+    if (filters.startDate) {
+      query.createdAt.$gte = new Date(filters.startDate);
+    }
+    if (filters.endDate) {
+      const end = new Date(filters.endDate);
+      end.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = end;
+    }
+  }
+  
+  return query;
+};
+
+responseSchema.statics.getFilteredResponses = async function(surveyId, filters = {}, pagination = {}) {
+  const query = this.buildFilterQuery(surveyId, filters);
+  
+  const { page = 1, limit = 20 } = pagination;
+  
+  const responses = await this.find(query)
+    .sort({ createdAt: -1 })
+    .limit(Number(limit))
+    .skip((Number(page) - 1) * Number(limit))
+    .select('id surveyId surveyVersion answers respondent metadata createdAt')
+    .lean();
+    
+  const total = await this.countDocuments(query);
+  
+  return {
+    responses,
+    pagination: {
+      page: Number(page),
+      limit: Number(limit),
+      total,
+      pages: Math.ceil(total / Number(limit))
+    }
+  };
 };
 
 const Response = mongoose.model('Response', responseSchema);

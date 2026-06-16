@@ -291,31 +291,65 @@ class StatisticsService {
   }
 
   static exportToCSV(survey, responses, version = null) {
-    const questions = version
-      ? survey.history.find(h => h.version === version)?.questions || survey.questions
-      : survey.questions;
-
-    const headers = ['回答ID', '提交时间', '用户ID', 'IP地址', ...questions.map(q => q.title)];
+    const allVersions = version 
+      ? [Number(version)] 
+      : [...new Set(responses.map(r => r.surveyVersion))].sort();
+    
+    const versionQuestionMap = {};
+    const allQuestionIds = new Set();
+    const questionMeta = {};
+    
+    for (const v of allVersions) {
+      const questions = v === survey.version
+        ? survey.questions
+        : (survey.history.find(h => h.version === v)?.questions || survey.questions);
+      
+      versionQuestionMap[v] = {};
+      for (const q of questions) {
+        versionQuestionMap[v][q.id] = q;
+        allQuestionIds.add(q.id);
+        if (!questionMeta[q.id]) {
+          questionMeta[q.id] = { title: q.title, order: q.order, type: q.type };
+        }
+      }
+    }
+    
+    const sortedQuestionIds = [...allQuestionIds].sort((a, b) => {
+      const oa = questionMeta[a]?.order ?? 999;
+      const ob = questionMeta[b]?.order ?? 999;
+      return oa - ob;
+    });
+    
+    const headers = [
+      '回答ID', 
+      '问卷版本',
+      '提交时间', 
+      '用户ID', 
+      'IP地址', 
+      '设备ID',
+      ...sortedQuestionIds.map(qid => {
+        const q = questionMeta[qid];
+        return q ? `${q.title} (${qid})` : `题目 ${qid}`;
+      })
+    ];
+    
+    const getAnswerValue = (response, questionId) => {
+      const answer = response.answers?.find(a => a.questionId === questionId);
+      if (!answer || answer.value === undefined || answer.value === null) return '';
+      if (Array.isArray(answer.value)) return answer.value.join('; ');
+      return String(answer.value);
+    };
     
     const rows = responses.map(response => {
       const row = [
         response.id,
-        response.createdAt.toISOString(),
-        response.respondent.userId || '匿名',
-        response.respondent.ipAddress
+        `v${response.surveyVersion}`,
+        new Date(response.createdAt).toISOString(),
+        response.respondent?.userId || '匿名',
+        response.respondent?.ipAddress || '',
+        response.respondent?.deviceId || '',
+        ...sortedQuestionIds.map(qid => getAnswerValue(response, qid))
       ];
-
-      for (const question of questions) {
-        const answer = response.getAnswerByQuestionId(question.id);
-        if (!answer) {
-          row.push('');
-        } else if (Array.isArray(answer.value)) {
-          row.push(answer.value.join('; '));
-        } else {
-          row.push(String(answer.value));
-        }
-      }
-
       return row;
     });
 

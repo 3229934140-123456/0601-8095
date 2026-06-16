@@ -6,6 +6,7 @@ const { auth, optionalAuth } = require('../middleware/auth');
 router.post('/', auth, surveyController.createSurvey);
 router.get('/', auth, surveyController.getSurveyList);
 router.get('/:id', optionalAuth, surveyController.getSurvey);
+router.get('/:id/entry', optionalAuth, surveyController.getFillEntry);
 router.get('/:id/versions', auth, surveyController.getSurveyVersions);
 router.put('/:id', auth, surveyController.updateSurvey);
 router.put('/:id/status', auth, surveyController.updateSurveyStatus);

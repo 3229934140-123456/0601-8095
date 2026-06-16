@@ -78,12 +78,21 @@ const surveySchema = new mongoose.Schema({
     }
   },
   settings: {
+    accessMode: { 
+      type: String, 
+      enum: ['public', 'login_required', 'invite_only'], 
+      default: 'public' 
+    },
+    accessPassword: { type: String, default: null },
     allowAnonymous: { type: Boolean, default: true },
     showProgress: { type: Boolean, default: true },
     shuffleQuestions: { type: Boolean, default: false },
     startTime: { type: Date, default: null },
     endTime: { type: Date, default: null },
-    maxResponses: { type: Number, default: null }
+    maxResponses: { type: Number, default: null },
+    redirectUrl: { type: String, default: null },
+    welcomeMessage: { type: String, default: null },
+    thankYouMessage: { type: String, default: null }
   },
   responseCount: {
     type: Number,
@@ -171,6 +180,77 @@ surveySchema.methods.validateQuestionStructure = function() {
   }
   
   return { valid: true };
+};
+
+surveySchema.methods.getFillEntryStatus = function(currentUser = null) {
+  const now = Date.now();
+  const reasons = [];
+  
+  let canFill = true;
+  
+  if (this.status !== SURVEY_STATUS.PUBLISHED) {
+    canFill = false;
+    reasons.push(this.status === SURVEY_STATUS.DRAFT ? '问卷尚未发布' : '问卷已关闭');
+  }
+  
+  if (this.settings?.startTime && now < new Date(this.settings.startTime).getTime()) {
+    canFill = false;
+    reasons.push(`填写尚未开始，将于 ${new Date(this.settings.startTime).toLocaleString()} 开放`);
+  }
+  
+  if (this.settings?.endTime && now > new Date(this.settings.endTime).getTime()) {
+    canFill = false;
+    reasons.push('填写已截止');
+  }
+  
+  if (this.settings?.maxResponses && this.responseCount >= this.settings.maxResponses) {
+    canFill = false;
+    reasons.push(`已达到最大填写数量限制 (${this.settings.maxResponses})`);
+  }
+  
+  if (this.settings?.accessMode === 'login_required' && !currentUser) {
+    canFill = false;
+    reasons.push('需要登录后才能填写');
+  }
+  
+  return {
+    canFill,
+    reasons,
+    details: {
+      status: this.status,
+      accessMode: this.settings?.accessMode || 'public',
+      requireLogin: this.settings?.accessMode === 'login_required',
+      requirePassword: !!this.settings?.accessPassword,
+      timeActive: !(this.settings?.startTime && now < new Date(this.settings.startTime).getTime()) &&
+                  !(this.settings?.endTime && now > new Date(this.settings.endTime).getTime()),
+      withinLimit: !this.settings?.maxResponses || this.responseCount < this.settings.maxResponses
+    }
+  };
+};
+
+surveySchema.methods.getFillEntryInfo = function(baseUrl = '') {
+  return {
+    fillUrl: `${baseUrl}/s/${this.id}`,
+    embedCode: `<iframe src="${baseUrl}/s/${this.id}/embed" width="100%" height="600" frameborder="0"></iframe>`,
+    qrCodeContent: `${baseUrl}/s/${this.id}`,
+    shareLinks: {
+      wechat: `${baseUrl}/s/${this.id}?platform=wechat`,
+      qq: `${baseUrl}/s/${this.id}?platform=qq`,
+      weibo: `${baseUrl}/s/${this.id}?platform=weibo`
+    },
+    configuration: {
+      accessMode: this.settings?.accessMode || 'public',
+      requireLogin: this.settings?.accessMode === 'login_required',
+      requirePassword: !!this.settings?.accessPassword,
+      startTime: this.settings?.startTime,
+      endTime: this.settings?.endTime,
+      maxResponses: this.settings?.maxResponses,
+      antiDuplicateMode: this.antiDuplicate?.mode,
+      allowAnonymous: this.settings?.allowAnonymous !== false,
+      showProgress: this.settings?.showProgress !== false,
+      shuffleQuestions: this.settings?.shuffleQuestions === true
+    }
+  };
 };
 
 surveySchema.statics.getFullSurvey = function(id) {

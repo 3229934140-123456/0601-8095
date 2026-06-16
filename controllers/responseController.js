@@ -147,7 +147,17 @@ exports.submitResponse = async (req, res, next) => {
 exports.getResponses = async (req, res, next) => {
   try {
     const { surveyId } = req.params;
-    const { version, page = 1, limit = 50 } = req.query;
+    const { 
+      version, 
+      userId, 
+      ipAddress, 
+      deviceId, 
+      fingerprint,
+      startDate,
+      endDate,
+      page = 1, 
+      limit = 50 
+    } = req.query;
     
     const survey = await Survey.findOne({ id: surveyId });
     
@@ -165,30 +175,31 @@ exports.getResponses = async (req, res, next) => {
       });
     }
     
-    const query = { surveyId };
-    if (version) {
-      query.surveyVersion = Number(version);
-    }
+    const filters = {
+      version: version !== undefined ? version : null,
+      userId: userId || null,
+      ipAddress: ipAddress || null,
+      deviceId: deviceId || null,
+      fingerprint: fingerprint || null,
+      startDate: startDate || null,
+      endDate: endDate || null
+    };
     
-    const responses = await Response.find(query)
-      .select('id surveyVersion answers respondent metadata createdAt')
-      .sort({ createdAt: -1 })
-      .limit(Number(limit))
-      .skip((Number(page) - 1) * Number(limit))
-      .lean();
+    const result = await Response.getFilteredResponses(
+      surveyId,
+      filters,
+      { page, limit }
+    );
     
-    const total = await Response.countDocuments(query);
+    const versionDistribution = await Response.getResponseCountByVersion(surveyId);
     
     res.json({
       success: true,
       data: {
-        responses,
-        pagination: {
-          page: Number(page),
-          limit: Number(limit),
-          total,
-          pages: Math.ceil(total / Number(limit))
-        }
+        responses: result.responses,
+        pagination: result.pagination,
+        appliedFilters: filters,
+        versionDistribution
       }
     });
   } catch (err) {

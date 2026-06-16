@@ -1,6 +1,7 @@
 const { Survey } = require('../models/Survey');
 const Response = require('../models/Response');
 const StatisticsService = require('../services/statisticsService');
+const { QUESTION_TYPES } = require('../models/Question');
 
 exports.getStatistics = async (req, res, next) => {
   try {
@@ -73,6 +74,8 @@ exports.getStatistics = async (req, res, next) => {
       });
     }
     
+    const comparisonSummary = buildVersionComparisonSummary(versionStats, survey);
+    
     res.json({
       success: true,
       data: {
@@ -80,6 +83,7 @@ exports.getStatistics = async (req, res, next) => {
         currentVersion: survey.version,
         versionDistribution,
         versions: versionStats,
+        comparisonSummary,
         summary: {
           totalResponses: allResponses.length,
           totalVersions: versionStats.length
@@ -90,6 +94,114 @@ exports.getStatistics = async (req, res, next) => {
     next(err);
   }
 };
+
+function buildVersionComparisonSummary(versionStats, survey) {
+  if (!versionStats || versionStats.length < 1) {
+    return null;
+  }
+  
+  const sortedVersions = [...versionStats].sort((a, b) => a.version - b.version);
+  
+  const perVersion = sortedVersions.map(vs => {
+    const questions = vs.version === survey.version
+      ? survey.questions
+      : (survey.history.find(h => h.version === vs.version)?.questions || survey.questions);
+    
+    const ratingQuestions = questions.filter(q => q.type === QUESTION_TYPES.RATING);
+    const singleChoiceQuestions = questions.filter(q => q.type === QUESTION_TYPES.SINGLE_CHOICE);
+    
+    const ratingMeans = ratingQuestions.map(q => {
+      const qStats = vs.statistics.questions.find(s => s.questionId === q.id);
+      return {
+        questionId: q.id,
+        title: q.title,
+        mean: qStats?.statistics?.mean ?? null
+      };
+    });
+    
+    const topChoices = singleChoiceQuestions.map(q => {
+      const qStats = vs.statistics.questions.find(s => s.questionId === q.id);
+      const mode = qStats?.statistics?.mode;
+      const maxCount = Math.max(...(Object.values(qStats?.statistics?.distribution || {})), 0);
+      return {
+        questionId: q.id,
+        title: q.title,
+        topOptionValue: mode?.value ?? null,
+        topOptionLabel: mode?.label ?? null,
+        topOptionCount: maxCount,
+        topOptionPercentage: qStats?.statistics?.options?.find(o => o.value === mode?.value)?.percentage ?? 0
+      };
+    });
+    
+    return {
+      version: vs.version,
+      isCurrent: vs.isCurrent,
+      responseCount: vs.responseCount,
+      ratingMeans,
+      topChoices
+    };
+  });
+  
+  const changes = [];
+  
+  if (perVersion.length >= 2) {
+    for (let i = 1; i < perVersion.length; i++) {
+      const prev = perVersion[i - 1];
+      const curr = perVersion[i];
+      const diff = {
+        fromVersion: prev.version,
+        toVersion: curr.version,
+        responseCountChange: {
+          before: prev.responseCount,
+          after: curr.responseCount,
+          delta: curr.responseCount - prev.responseCount,
+          deltaPercent: prev.responseCount > 0 
+            ? Math.round(((curr.responseCount - prev.responseCount) / prev.responseCount) * 10000) / 100
+            : null
+        },
+        ratingMeanChanges: [],
+        topChoiceChanges: []
+      };
+      
+      for (const prevRating of prev.ratingMeans) {
+        const currRating = curr.ratingMeans.find(r => r.questionId === prevRating.questionId);
+        if (currRating && prevRating.mean !== null && currRating.mean !== null) {
+          diff.ratingMeanChanges.push({
+            questionId: prevRating.questionId,
+            title: prevRating.title,
+            before: prevRating.mean,
+            after: currRating.mean,
+            delta: Math.round((currRating.mean - prevRating.mean) * 100) / 100
+          });
+        }
+      }
+      
+      for (const prevChoice of prev.topChoices) {
+        const currChoice = curr.topChoices.find(c => c.questionId === prevChoice.questionId);
+        if (currChoice) {
+          diff.topChoiceChanges.push({
+            questionId: prevChoice.questionId,
+            title: prevChoice.title,
+            changed: prevChoice.topOptionValue !== currChoice.topOptionValue,
+            before: { value: prevChoice.topOptionValue, label: prevChoice.topOptionLabel, count: prevChoice.topOptionCount, percentage: prevChoice.topOptionPercentage },
+            after: { value: currChoice.topOptionValue, label: currChoice.topOptionLabel, count: currChoice.topOptionCount, percentage: currChoice.topOptionPercentage }
+          });
+        }
+      }
+      
+      changes.push(diff);
+    }
+  }
+  
+  return {
+    perVersion,
+    changes,
+    currentRank: sortedVersions.map(vs => ({
+      version: vs.version,
+      responseCount: vs.responseCount
+    }))
+  };
+}
 
 exports.getQuestionStatistics = async (req, res, next) => {
   try {
@@ -146,7 +258,15 @@ exports.getQuestionStatistics = async (req, res, next) => {
 exports.exportCSV = async (req, res, next) => {
   try {
     const { surveyId } = req.params;
-    const { version } = req.query;
+    const { 
+      version,
+      userId,
+      ipAddress,
+      deviceId,
+      fingerprint,
+      startDate,
+      endDate
+    } = req.query;
     
     const survey = await Survey.getFullSurvey(surveyId);
     
@@ -164,12 +284,29 @@ exports.exportCSV = async (req, res, next) => {
       });
     }
     
-    const targetVersion = version ? Number(version) : null;
-    const responses = await Response.getResponsesBySurveyVersion(surveyId, targetVersion);
+    const filters = {
+      version: version !== undefined ? version : null,
+      userId: userId || null,
+      ipAddress: ipAddress || null,
+      deviceId: deviceId || null,
+      fingerprint: fingerprint || null,
+      startDate: startDate || null,
+      endDate: endDate || null
+    };
     
+    const query = Response.buildFilterQuery(surveyId, filters);
+    const responses = await Response.find(query).sort({ createdAt: -1 }).lean();
+    
+    const targetVersion = version ? Number(version) : null;
     const csvContent = StatisticsService.exportToCSV(survey, responses, targetVersion);
     
-    const filename = `survey-${surveyId}-${targetVersion || 'all'}-${Date.now()}.csv`;
+    const filterSuffix = [
+      version ? `v${version}` : null,
+      userId ? `user-${userId}` : null,
+      ipAddress ? `ip-${ipAddress.replace(/\./g, '-')}` : null
+    ].filter(Boolean).join('_');
+    
+    const filename = `survey-${surveyId}-${filterSuffix || 'filtered'}-${Date.now()}.csv`;
     
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
