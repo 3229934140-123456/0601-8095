@@ -1,4 +1,5 @@
 const { Survey, SURVEY_STATUS } = require('../models/Survey');
+const { InviteLink, INVITE_STATUS } = require('../models/InviteLink');
 const ValidationService = require('../services/validationService');
 const crypto = require('crypto');
 
@@ -132,7 +133,7 @@ exports.getSurvey = async (req, res, next) => {
 exports.getFillEntry = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { password } = req.query;
+    const { password, inviteCode } = req.query;
     
     const survey = await Survey.findOne({ id }).select('id title description status version questions settings antiDuplicate responseCount');
     
@@ -155,6 +156,34 @@ exports.getFillEntry = async (req, res, next) => {
       }
     }
     
+    let inviteInfo = null;
+    if (survey.settings?.accessMode === 'invite_only') {
+      entryStatus.details.requireInvite = true;
+      
+      if (!inviteCode) {
+        entryStatus.canFill = false;
+        entryStatus.reasons.push('需要邀请码才能填写');
+      } else {
+        const invite = await InviteLink.getByCode(inviteCode);
+        if (!invite || invite.surveyId !== survey.id) {
+          entryStatus.canFill = false;
+          entryStatus.reasons.push('邀请码无效');
+        } else {
+          const usability = invite.isUsable();
+          if (!usability.usable) {
+            entryStatus.canFill = false;
+            entryStatus.reasons.push(usability.reason);
+          } else {
+            inviteInfo = {
+              code: invite.code,
+              status: invite.status,
+              remainingUses: invite.maxUses - invite.currentUses
+            };
+          }
+        }
+      }
+    }
+    
     const responseData = {
       id: survey.id,
       title: survey.title,
@@ -172,11 +201,13 @@ exports.getFillEntry = async (req, res, next) => {
         mode: survey.antiDuplicate?.mode
       },
       entryStatus,
+      inviteInfo,
       fillEntry: {
         configuration: {
           accessMode: survey.settings?.accessMode || 'public',
           requireLogin: survey.settings?.accessMode === 'login_required',
           requirePassword: !!survey.settings?.accessPassword,
+          requireInvite: survey.settings?.accessMode === 'invite_only',
           startTime: survey.settings?.startTime,
           endTime: survey.settings?.endTime,
           allowAnonymous: survey.settings?.allowAnonymous !== false
@@ -447,6 +478,232 @@ exports.getSurveyVersions = async (req, res, next) => {
       success: true,
       data: {
         versions
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.batchCreateInvites = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { count = 10, maxUses = 1, expiresAt = null, note = null } = req.body;
+    
+    const survey = await Survey.findOne({ id });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (survey.createdBy !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: '无权限管理此问卷的邀请链接'
+      });
+    }
+    
+    const validCount = Math.min(Math.max(Number(count) || 1, 1), 500);
+    const validMaxUses = Math.max(Number(maxUses) || 1, 1);
+    
+    const invites = await InviteLink.batchCreate(id, req.user.id, validCount, {
+      maxUses: validMaxUses,
+      expiresAt: expiresAt ? new Date(expiresAt) : null,
+      note: note?.substring?.(0, 200) || null
+    });
+    
+    const baseUrl = getBaseUrl(req);
+    const inviteList = invites.map(inv => ({
+      id: inv.id,
+      code: inv.code,
+      url: `${baseUrl}/s/${id}?inviteCode=${inv.code}`,
+      status: inv.status,
+      maxUses: inv.maxUses,
+      currentUses: inv.currentUses,
+      expiresAt: inv.expiresAt,
+      note: inv.note,
+      createdAt: inv.createdAt
+    }));
+    
+    res.status(201).json({
+      success: true,
+      message: `成功生成 ${inviteList.length} 个邀请链接`,
+      data: {
+        invites: inviteList,
+        count: inviteList.length
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getInviteList = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { status, page = 1, limit = 50 } = req.query;
+    
+    const survey = await Survey.findOne({ id });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (survey.createdBy !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: '无权限查看此问卷的邀请链接'
+      });
+    }
+    
+    const result = await InviteLink.getSurveyInvites(id, { status, page, limit });
+    
+    const baseUrl = getBaseUrl(req);
+    const invitesWithUrl = result.invites.map(inv => ({
+      ...inv,
+      url: `${baseUrl}/s/${id}?inviteCode=${inv.code}`
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        invites: invitesWithUrl,
+        pagination: result.pagination
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getInviteStats = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    
+    const survey = await Survey.findOne({ id });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (survey.createdBy !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: '无权限查看此问卷的邀请链接'
+      });
+    }
+    
+    const stats = await InviteLink.getStatsBySurvey(id);
+    
+    res.json({
+      success: true,
+      data: { stats }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.revokeInvite = async (req, res, next) => {
+  try {
+    const { id, inviteId } = req.params;
+    
+    const survey = await Survey.findOne({ id });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (survey.createdBy !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: '无权限管理此问卷的邀请链接'
+      });
+    }
+    
+    const invite = await InviteLink.findOne({ id: inviteId, surveyId: id });
+    
+    if (!invite) {
+      return res.status(404).json({
+        success: false,
+        message: '邀请链接不存在'
+      });
+    }
+    
+    invite.status = INVITE_STATUS.REVOKED;
+    await invite.save();
+    
+    res.json({
+      success: true,
+      message: '邀请链接已作废',
+      data: { invite }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.verifyInvite = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { code } = req.query;
+    
+    const survey = await Survey.findOne({ id });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (!code) {
+      return res.status(400).json({
+        success: false,
+        message: '邀请码不能为空'
+      });
+    }
+    
+    const invite = await InviteLink.getByCode(code);
+    
+    if (!invite || invite.surveyId !== id) {
+      return res.json({
+        success: true,
+        data: {
+          valid: false,
+          reason: '邀请码无效'
+        }
+      });
+    }
+    
+    const usability = invite.isUsable();
+    
+    res.json({
+      success: true,
+      data: {
+        valid: usability.usable,
+        reason: usability.usable ? null : usability.reason,
+        invite: {
+          code: invite.code,
+          status: invite.status,
+          maxUses: invite.maxUses,
+          currentUses: invite.currentUses,
+          remainingUses: invite.maxUses - invite.currentUses,
+          expiresAt: invite.expiresAt,
+          note: invite.note
+        }
       }
     });
   } catch (err) {

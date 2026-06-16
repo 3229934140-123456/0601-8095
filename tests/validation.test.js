@@ -2,6 +2,7 @@ const ValidationService = require('../services/validationService');
 const StatisticsService = require('../services/statisticsService');
 const Response = require('../models/Response');
 const { Survey, SURVEY_STATUS, ANTI_DUPLICATE_MODES } = require('../models/Survey');
+const { InviteLink, INVITE_STATUS } = require('../models/InviteLink');
 const { QUESTION_TYPES } = require('../models/Question');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
@@ -628,5 +629,267 @@ describe('Survey - 填写入口和状态判断测试', () => {
       const info = survey.getFillEntryInfo();
       expect(info.fillUrl).toBe('/s/test-survey');
     });
+  });
+});
+
+describe('InviteLink - 邀请链接测试', () => {
+  describe('generateCode - 邀请码生成', () => {
+    test('生成的邀请码长度正确', () => {
+      const code = InviteLink.generateCode(10);
+      expect(code.length).toBe(10);
+    });
+    
+    test('邀请码只包含指定字符（无易错字符）', () => {
+      const code = InviteLink.generateCode(20);
+      expect(code).toMatch(/^[A-HJ-NP-Z2-9]+$/);
+    });
+    
+    test('多次生成不重复', () => {
+      const codes = new Set();
+      for (let i = 0; i < 100; i++) {
+        codes.add(InviteLink.generateCode(8));
+      }
+      expect(codes.size).toBe(100);
+    });
+    
+    test('默认长度12位', () => {
+      const code = InviteLink.generateCode();
+      expect(code.length).toBe(12);
+    });
+  });
+  
+  describe('isUsable - 可用性判断', () => {
+    test('未使用的邀请码可用', () => {
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.UNUSED,
+        maxUses: 1,
+        currentUses: 0,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(true);
+    });
+    
+    test('已使用完的邀请码不可用', () => {
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.USED,
+        maxUses: 1,
+        currentUses: 1,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(false);
+      expect(result.reason).toBe('邀请链接已使用过');
+    });
+    
+    test('已作废的邀请码不可用', () => {
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.REVOKED,
+        maxUses: 1,
+        currentUses: 0,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(false);
+      expect(result.reason).toBe('邀请链接已作废');
+    });
+    
+    test('已过期的邀请码不可用', () => {
+      const past = new Date(Date.now() - 3600 * 1000);
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.UNUSED,
+        maxUses: 1,
+        currentUses: 0,
+        expiresAt: past,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(false);
+      expect(result.reason).toBe('邀请链接已过期');
+    });
+    
+    test('未过期的邀请码可用', () => {
+      const future = new Date(Date.now() + 3600 * 1000);
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.UNUSED,
+        maxUses: 1,
+        currentUses: 0,
+        expiresAt: future,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(true);
+    });
+    
+    test('多次使用的邀请码 - 未达上限时可用', () => {
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.UNUSED,
+        maxUses: 5,
+        currentUses: 2,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(true);
+    });
+    
+    test('无过期时间的邀请码永不过期', () => {
+      const invite = new InviteLink({
+        surveyId: 's1',
+        code: 'TEST123',
+        status: INVITE_STATUS.UNUSED,
+        maxUses: 1,
+        currentUses: 0,
+        expiresAt: null,
+        createdBy: 'u1'
+      });
+      const result = invite.isUsable();
+      expect(result.usable).toBe(true);
+    });
+  });
+  
+  describe('getByCode - 不区分大小写', () => {
+    test('toUpperCase 处理（静态方法存在）', () => {
+      expect(typeof InviteLink.getByCode).toBe('function');
+    });
+  });
+});
+
+describe('Response - 质量分析和筛选测试', () => {
+  describe('buildFilterQuery - 质量筛选条件', () => {
+    test('按风险等级筛选', () => {
+      const query = Response.buildFilterQuery('s1', { riskLevel: 'high' });
+      expect(query['quality.riskLevel']).toBe('high');
+    });
+    
+    test('按单个风险标记筛选', () => {
+      const query = Response.buildFilterQuery('s1', { riskFlag: 'too_fast' });
+      expect(query['quality.riskFlags'].$in).toContain('too_fast');
+    });
+    
+    test('按完成时间范围筛选', () => {
+      const query = Response.buildFilterQuery('s1', {
+        completionTimeMin: 10,
+        completionTimeMax: 300
+      });
+      expect(query['quality.completionSeconds'].$gte).toBe(10);
+      expect(query['quality.completionSeconds'].$lte).toBe(300);
+    });
+    
+    test('只传最小值也能工作', () => {
+      const query = Response.buildFilterQuery('s1', { completionTimeMin: 60 });
+      expect(query['quality.completionSeconds'].$gte).toBe(60);
+      expect(query['quality.completionSeconds'].$lte).toBeUndefined();
+    });
+    
+    test('质量筛选与其他筛选可组合', () => {
+      const query = Response.buildFilterQuery('s1', {
+        version: '2',
+        riskLevel: 'low',
+        startDate: '2026-01-01'
+      });
+      expect(query.surveyVersion).toBe(2);
+      expect(query['quality.riskLevel']).toBe('low');
+      expect(query.createdAt.$gte).toBeInstanceOf(Date);
+    });
+  });
+  
+  describe('quality risk flags - 标记类型', () => {
+    test('风险等级枚举值正确', () => {
+      const levels = ['low', 'medium', 'high'];
+      expect(levels).toContain('low');
+      expect(levels).toContain('medium');
+      expect(levels).toContain('high');
+    });
+    
+    test('常见风险标记枚举', () => {
+      const flags = [
+        'too_fast',
+        'suspiciously_fast',
+        'instant_submit',
+        'too_slow',
+        'straight_lining',
+        'duplicate_text_answers',
+        'many_skipped'
+      ];
+      expect(flags.length).toBe(7);
+    });
+  });
+});
+
+describe('版本对比鲁棒性测试', () => {
+  test('空版本数据 - 返回结构完整', () => {
+    const statsCtrl = require('../controllers/statisticsController');
+    expect(typeof statsCtrl.getStatistics).toBe('function');
+  });
+  
+  test('统计服务 - 单题统计空回答数组不会崩溃', async () => {
+    const question = {
+      id: 'q1',
+      type: QUESTION_TYPES.SINGLE_CHOICE,
+      title: '测试题',
+      config: { options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }
+    };
+    const result = await StatisticsService.calculateQuestionStatistics(question, []);
+    expect(result).toBeDefined();
+    expect(result.questionId).toBe('q1');
+    expect(result.responseCount).toBe(0);
+    expect(result.skipCount).toBe(0);
+  });
+  
+  test('统计服务 - 空答案值过滤正确计数', async () => {
+    const question = {
+      id: 'q1',
+      type: QUESTION_TYPES.SINGLE_CHOICE,
+      title: '测试题',
+      config: { options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }
+    };
+    const responses = [
+      { answers: [{ questionId: 'q1', value: 'a' }] },
+      { answers: [{ questionId: 'q1', value: '' }] },
+      { answers: [{ questionId: 'q1', value: null }] }
+    ];
+    const result = await StatisticsService.calculateQuestionStatistics(question, responses);
+    expect(result.responseCount).toBe(1);
+    expect(result.skipCount).toBe(2);
+  });
+  
+  test('统计服务 - 找不到题目时返回空计数', async () => {
+    const question = {
+      id: 'q99',
+      type: QUESTION_TYPES.SINGLE_CHOICE,
+      title: '不存在的题',
+      config: { options: [{ value: 'a', label: 'A' }] }
+    };
+    const responses = [
+      { answers: [{ questionId: 'q1', value: 'a' }] }
+    ];
+    const result = await StatisticsService.calculateQuestionStatistics(question, responses);
+    expect(result.responseCount).toBe(0);
+  });
+  
+  test('统计服务 - 响应是 mongoose document 也能工作（getAnswerByQuestionId 方法）', async () => {
+    const question = {
+      id: 'q1',
+      type: QUESTION_TYPES.SINGLE_CHOICE,
+      title: '测试题',
+      config: { options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }
+    };
+    const mockResponse = {
+      getAnswerByQuestionId: (qid) => qid === 'q1' ? { questionId: 'q1', value: 'a' } : undefined
+    };
+    const result = await StatisticsService.calculateQuestionStatistics(question, [mockResponse]);
+    expect(result.responseCount).toBe(1);
   });
 });

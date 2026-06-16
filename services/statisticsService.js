@@ -36,8 +36,18 @@ class StatisticsService {
   }
 
   static async calculateQuestionStatistics(question, responses) {
+    const getAnswer = (response, qId) => {
+      if (typeof response.getAnswerByQuestionId === 'function') {
+        return response.getAnswerByQuestionId(qId);
+      }
+      if (Array.isArray(response.answers)) {
+        return response.answers.find(a => a && a.questionId === qId);
+      }
+      return undefined;
+    };
+    
     const answers = responses
-      .map(r => r.getAnswerByQuestionId(question.id))
+      .map(r => getAnswer(r, question.id))
       .filter(a => a !== undefined && a.value !== null && a.value !== '');
 
     const responseCount = answers.length;

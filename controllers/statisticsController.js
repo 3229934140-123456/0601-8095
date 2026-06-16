@@ -96,47 +96,106 @@ exports.getStatistics = async (req, res, next) => {
 };
 
 function buildVersionComparisonSummary(versionStats, survey) {
-  if (!versionStats || versionStats.length < 1) {
-    return null;
+  const result = {
+    perVersion: [],
+    changes: [],
+    currentRank: [],
+    meta: {
+      totalVersions: 0,
+      hasMultipleVersions: false,
+      hasEmptyVersions: false
+    }
+  };
+  
+  if (!versionStats || versionStats.length === 0) {
+    return result;
   }
+  
+  const safeGet = (obj, path, defaultValue = null) => {
+    try {
+      return path.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : defaultValue), obj);
+    } catch (e) {
+      return defaultValue;
+    }
+  };
   
   const sortedVersions = [...versionStats].sort((a, b) => a.version - b.version);
   
   const perVersion = sortedVersions.map(vs => {
-    const questions = vs.version === survey.version
-      ? survey.questions
-      : (survey.history.find(h => h.version === vs.version)?.questions || survey.questions);
+    let questions = [];
+    try {
+      questions = vs.version === survey.version
+        ? (survey.questions || [])
+        : (survey.history?.find(h => h.version === vs.version)?.questions || survey.questions || []);
+    } catch (e) {
+      questions = [];
+    }
     
-    const ratingQuestions = questions.filter(q => q.type === QUESTION_TYPES.RATING);
-    const singleChoiceQuestions = questions.filter(q => q.type === QUESTION_TYPES.SINGLE_CHOICE);
+    const ratingQuestions = Array.isArray(questions) 
+      ? questions.filter(q => q && q.type === QUESTION_TYPES.RATING) 
+      : [];
+    const singleChoiceQuestions = Array.isArray(questions)
+      ? questions.filter(q => q && q.type === QUESTION_TYPES.SINGLE_CHOICE)
+      : [];
+    const multipleChoiceQuestions = Array.isArray(questions)
+      ? questions.filter(q => q && q.type === QUESTION_TYPES.MULTIPLE_CHOICE)
+      : [];
+    
+    const statsQuestions = Array.isArray(safeGet(vs, 'statistics.questions', []))
+      ? vs.statistics.questions
+      : [];
     
     const ratingMeans = ratingQuestions.map(q => {
-      const qStats = vs.statistics.questions.find(s => s.questionId === q.id);
+      const qStats = statsQuestions.find(s => s && s.questionId === q.id);
+      const mean = safeGet(qStats, 'statistics.mean', null);
       return {
         questionId: q.id,
-        title: q.title,
-        mean: qStats?.statistics?.mean ?? null
+        title: q.title || `题目 ${q.id}`,
+        order: q.order ?? 999,
+        mean: typeof mean === 'number' ? mean : null,
+        responseCount: safeGet(qStats, 'responseCount', 0) || 0
       };
     });
     
     const topChoices = singleChoiceQuestions.map(q => {
-      const qStats = vs.statistics.questions.find(s => s.questionId === q.id);
-      const mode = qStats?.statistics?.mode;
-      const maxCount = Math.max(...(Object.values(qStats?.statistics?.distribution || {})), 0);
+      const qStats = statsQuestions.find(s => s && s.questionId === q.id);
+      const distribution = safeGet(qStats, 'statistics.distribution', {}) || {};
+      const options = safeGet(qStats, 'statistics.options', []) || [];
+      const mode = safeGet(qStats, 'statistics.mode', null);
+      
+      const counts = Object.values(distribution).filter(v => typeof v === 'number');
+      const maxCount = counts.length > 0 ? Math.max(...counts) : 0;
+      
+      const totalResponses = safeGet(qStats, 'responseCount', 0) || 0;
+      const topOption = mode ? options.find(o => o && o.value === mode.value) : null;
+      
       return {
         questionId: q.id,
-        title: q.title,
+        title: q.title || `题目 ${q.id}`,
+        order: q.order ?? 999,
         topOptionValue: mode?.value ?? null,
-        topOptionLabel: mode?.label ?? null,
+        topOptionLabel: mode?.label ?? (topOption?.label ?? null),
         topOptionCount: maxCount,
-        topOptionPercentage: qStats?.statistics?.options?.find(o => o.value === mode?.value)?.percentage ?? 0
+        topOptionPercentage: topOption?.percentage ?? 0,
+        responseCount: totalResponses
       };
     });
     
+    const hasResponses = (vs.responseCount || 0) > 0;
+    
     return {
       version: vs.version,
-      isCurrent: vs.isCurrent,
-      responseCount: vs.responseCount,
+      isCurrent: !!vs.isCurrent,
+      responseCount: vs.responseCount || 0,
+      hasResponses,
+      title: vs.title || `版本 ${vs.version}`,
+      createdAt: vs.createdAt || null,
+      questionCount: {
+        total: questions.length,
+        rating: ratingQuestions.length,
+        singleChoice: singleChoiceQuestions.length,
+        multipleChoice: multipleChoiceQuestions.length
+      },
       ratingMeans,
       topChoices
     };
@@ -144,63 +203,118 @@ function buildVersionComparisonSummary(versionStats, survey) {
   
   const changes = [];
   
-  if (perVersion.length >= 2) {
-    for (let i = 1; i < perVersion.length; i++) {
-      const prev = perVersion[i - 1];
-      const curr = perVersion[i];
-      const diff = {
-        fromVersion: prev.version,
-        toVersion: curr.version,
-        responseCountChange: {
-          before: prev.responseCount,
-          after: curr.responseCount,
-          delta: curr.responseCount - prev.responseCount,
-          deltaPercent: prev.responseCount > 0 
-            ? Math.round(((curr.responseCount - prev.responseCount) / prev.responseCount) * 10000) / 100
-            : null
-        },
-        ratingMeanChanges: [],
-        topChoiceChanges: []
-      };
-      
-      for (const prevRating of prev.ratingMeans) {
-        const currRating = curr.ratingMeans.find(r => r.questionId === prevRating.questionId);
-        if (currRating && prevRating.mean !== null && currRating.mean !== null) {
-          diff.ratingMeanChanges.push({
-            questionId: prevRating.questionId,
-            title: prevRating.title,
-            before: prevRating.mean,
-            after: currRating.mean,
-            delta: Math.round((currRating.mean - prevRating.mean) * 100) / 100
-          });
-        }
-      }
-      
-      for (const prevChoice of prev.topChoices) {
-        const currChoice = curr.topChoices.find(c => c.questionId === prevChoice.questionId);
-        if (currChoice) {
-          diff.topChoiceChanges.push({
-            questionId: prevChoice.questionId,
-            title: prevChoice.title,
-            changed: prevChoice.topOptionValue !== currChoice.topOptionValue,
-            before: { value: prevChoice.topOptionValue, label: prevChoice.topOptionLabel, count: prevChoice.topOptionCount, percentage: prevChoice.topOptionPercentage },
-            after: { value: currChoice.topOptionValue, label: currChoice.topOptionLabel, count: currChoice.topOptionCount, percentage: currChoice.topOptionPercentage }
-          });
-        }
-      }
-      
-      changes.push(diff);
+  for (let i = 1; i < perVersion.length; i++) {
+    const prev = perVersion[i - 1];
+    const curr = perVersion[i];
+    
+    const prevCount = prev.responseCount || 0;
+    const currCount = curr.responseCount || 0;
+    
+    const diff = {
+      fromVersion: prev.version,
+      fromTitle: prev.title,
+      toVersion: curr.version,
+      toTitle: curr.title,
+      responseCountChange: {
+        before: prevCount,
+        after: currCount,
+        delta: currCount - prevCount,
+        deltaPercent: prevCount > 0 
+          ? Math.round(((currCount - prevCount) / prevCount) * 10000) / 100
+          : (currCount > 0 ? 100 : 0)
+      },
+      questionChanges: {
+        added: 0,
+        removed: 0,
+        titleChanged: 0,
+        typeChanged: 0
+      },
+      ratingMeanChanges: [],
+      topChoiceChanges: []
+    };
+    
+    const prevQids = new Set([...prev.ratingMeans.map(r => r.questionId), ...prev.topChoices.map(t => t.questionId)]);
+    const currQids = new Set([...curr.ratingMeans.map(r => r.questionId), ...curr.topChoices.map(t => t.questionId)]);
+    const allQids = new Set([...prevQids, ...currQids]);
+    
+    for (const qid of allQids) {
+      const inPrev = prevQids.has(qid);
+      const inCurr = currQids.has(qid);
+      if (inPrev && !inCurr) diff.questionChanges.removed++;
+      if (!inPrev && inCurr) diff.questionChanges.added++;
     }
+    
+    for (const prevRating of prev.ratingMeans) {
+      const currRating = curr.ratingMeans.find(r => r.questionId === prevRating.questionId);
+      if (currRating) {
+        if (prevRating.title !== currRating.title) {
+          diff.questionChanges.titleChanged++;
+        }
+        
+        const prevMean = typeof prevRating.mean === 'number' ? prevRating.mean : null;
+        const currMean = typeof currRating.mean === 'number' ? currRating.mean : null;
+        
+        diff.ratingMeanChanges.push({
+          questionId: prevRating.questionId,
+          title: currRating.title,
+          before: prevMean,
+          after: currMean,
+          delta: (prevMean !== null && currMean !== null)
+            ? Math.round((currMean - prevMean) * 100) / 100
+            : null,
+          status: 'unchanged'
+        });
+      }
+    }
+    
+    for (const prevChoice of prev.topChoices) {
+      const currChoice = curr.topChoices.find(c => c.questionId === prevChoice.questionId);
+      if (currChoice) {
+        const changed = prevChoice.topOptionValue !== currChoice.topOptionValue;
+        diff.topChoiceChanges.push({
+          questionId: prevChoice.questionId,
+          title: currChoice.title,
+          changed,
+          status: changed ? 'changed' : 'unchanged',
+          before: {
+            value: prevChoice.topOptionValue,
+            label: prevChoice.topOptionLabel,
+            count: prevChoice.topOptionCount,
+            percentage: prevChoice.topOptionPercentage,
+            responseCount: prevChoice.responseCount
+          },
+          after: {
+            value: currChoice.topOptionValue,
+            label: currChoice.topOptionLabel,
+            count: currChoice.topOptionCount,
+            percentage: currChoice.topOptionPercentage,
+            responseCount: currChoice.responseCount
+          }
+        });
+      }
+    }
+    
+    changes.push(diff);
   }
   
-  return {
-    perVersion,
-    changes,
-    currentRank: sortedVersions.map(vs => ({
+  result.perVersion = perVersion;
+  result.changes = changes;
+  result.currentRank = perVersion
+    .slice()
+    .sort((a, b) => b.responseCount - a.responseCount)
+    .map(vs => ({
       version: vs.version,
+      isCurrent: vs.isCurrent,
+      title: vs.title,
       responseCount: vs.responseCount
-    }))
+    }));
+  result.meta = {
+    totalVersions: perVersion.length,
+    hasMultipleVersions: perVersion.length >= 2,
+    hasEmptyVersions: perVersion.some(v => !v.hasResponses)
   };
+  
+  return result;
 }
 
 exports.getQuestionStatistics = async (req, res, next) => {

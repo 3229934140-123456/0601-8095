@@ -1,5 +1,6 @@
 const { Survey } = require('../models/Survey');
 const Response = require('../models/Response');
+const { InviteLink } = require('../models/InviteLink');
 const ValidationService = require('../services/validationService');
 const { QUESTION_TYPES } = require('../models/Question');
 
@@ -13,7 +14,7 @@ const getClientIp = (req) => {
 exports.submitResponse = async (req, res, next) => {
   try {
     const { surveyId } = req.params;
-    const { answers, metadata, deviceId, fingerprint } = req.body;
+    const { answers, metadata, deviceId, fingerprint, inviteCode } = req.body;
     
     const survey = await Survey.getFullSurvey(surveyId);
     
@@ -24,20 +25,63 @@ exports.submitResponse = async (req, res, next) => {
       });
     }
     
-    const statusValidation = ValidationService.validateSurveyStatus(survey);
-    if (!statusValidation.valid) {
+    const currentUser = req.user || null;
+    const entryStatus = survey.getFillEntryStatus(currentUser);
+    
+    if (!entryStatus.canFill) {
+      const isAuthIssue = entryStatus.reasons.some(r => 
+        r.includes('需要登录') || r.includes('登录后')
+      );
+      
+      if (isAuthIssue) {
+        return res.status(401).json({
+          success: false,
+          message: entryStatus.reasons[0] || '需要登录后才能填写',
+          data: {
+            canFill: false,
+            requireLogin: true,
+            reasons: entryStatus.reasons
+          }
+        });
+      }
+      
       return res.status(400).json({
         success: false,
-        message: '问卷无法提交',
-        errors: statusValidation.errors
+        message: entryStatus.reasons[0] || '问卷无法提交',
+        data: {
+          canFill: false,
+          reasons: entryStatus.reasons
+        }
       });
     }
     
-    if (!survey.settings.allowAnonymous && !req.user) {
-      return res.status(401).json({
-        success: false,
-        message: '此问卷需要登录才能填写'
-      });
+    let invite = null;
+    if (survey.settings?.accessMode === 'invite_only') {
+      if (!inviteCode) {
+        return res.status(400).json({
+          success: false,
+          message: '需要邀请码才能填写',
+          data: { canFill: false, requireInvite: true }
+        });
+      }
+      
+      invite = await InviteLink.getByCode(inviteCode);
+      if (!invite || invite.surveyId !== survey.id) {
+        return res.status(400).json({
+          success: false,
+          message: '邀请码无效',
+          data: { canFill: false, invalidInvite: true }
+        });
+      }
+      
+      const usability = invite.isUsable();
+      if (!usability.usable) {
+        return res.status(400).json({
+          success: false,
+          message: usability.reason,
+          data: { canFill: false, inviteStatus: invite.status }
+        });
+      }
     }
     
     const respondent = {
@@ -130,6 +174,14 @@ exports.submitResponse = async (req, res, next) => {
     survey.responseCount += 1;
     await survey.save();
     
+    if (invite) {
+      try {
+        await invite.markUsed(respondent, createResult.response.id);
+      } catch (e) {
+        console.warn('标记邀请码使用失败:', e.message);
+      }
+    }
+    
     res.status(201).json({
       success: true,
       message: '提交成功',
@@ -200,6 +252,63 @@ exports.getResponses = async (req, res, next) => {
         pagination: result.pagination,
         appliedFilters: filters,
         versionDistribution
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.getQualityAnalysis = async (req, res, next) => {
+  try {
+    const { surveyId } = req.params;
+    const { 
+      version, 
+      userId, 
+      ipAddress, 
+      deviceId, 
+      fingerprint,
+      startDate,
+      endDate,
+      riskLevel,
+      riskFlag
+    } = req.query;
+    
+    const survey = await Survey.findOne({ id: surveyId });
+    
+    if (!survey) {
+      return res.status(404).json({
+        success: false,
+        message: '问卷不存在'
+      });
+    }
+    
+    if (survey.createdBy !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: '无权限查看此问卷的质量分析'
+      });
+    }
+    
+    const filters = {
+      version: version !== undefined ? version : null,
+      userId: userId || null,
+      ipAddress: ipAddress || null,
+      deviceId: deviceId || null,
+      fingerprint: fingerprint || null,
+      startDate: startDate || null,
+      endDate: endDate || null,
+      riskLevel: riskLevel || null,
+      riskFlag: riskFlag || null
+    };
+    
+    const analysis = await Response.analyzeResponsesQuality(surveyId, filters);
+    
+    res.json({
+      success: true,
+      data: {
+        analysis,
+        appliedFilters: filters
       }
     });
   } catch (err) {
@@ -312,7 +421,7 @@ exports.deleteResponse = async (req, res, next) => {
 exports.checkCanSubmit = async (req, res, next) => {
   try {
     const { surveyId } = req.params;
-    const { deviceId, fingerprint } = req.query;
+    const { deviceId, fingerprint, inviteCode } = req.query;
     
     const survey = await Survey.getFullSurvey(surveyId);
     
@@ -323,24 +432,52 @@ exports.checkCanSubmit = async (req, res, next) => {
       });
     }
     
-    const statusValidation = ValidationService.validateSurveyStatus(survey);
-    if (!statusValidation.valid) {
-      return res.json({
-        success: true,
-        data: {
-          canSubmit: false,
-          reason: statusValidation.errors[0]
+    const currentUser = req.user || null;
+    const entryStatus = survey.getFillEntryStatus(currentUser);
+    
+    let inviteInfo = null;
+    if (survey.settings?.accessMode === 'invite_only') {
+      entryStatus.details.requireInvite = true;
+      
+      if (!inviteCode) {
+        entryStatus.canFill = false;
+        entryStatus.reasons.push('需要邀请码才能填写');
+      } else {
+        const invite = await InviteLink.getByCode(inviteCode);
+        if (!invite || invite.surveyId !== survey.id) {
+          entryStatus.canFill = false;
+          entryStatus.reasons.push('邀请码无效');
+        } else {
+          const usability = invite.isUsable();
+          if (!usability.usable) {
+            entryStatus.canFill = false;
+            entryStatus.reasons.push(usability.reason);
+          } else {
+            inviteInfo = {
+              code: invite.code,
+              status: invite.status,
+              remainingUses: invite.maxUses - invite.currentUses
+            };
+          }
         }
-      });
+      }
     }
     
-    if (!survey.settings.allowAnonymous && !req.user) {
+    if (!entryStatus.canFill) {
+      const isAuthIssue = entryStatus.reasons.some(r => 
+        r.includes('需要登录') || r.includes('登录后')
+      );
+      
       return res.json({
         success: true,
         data: {
           canSubmit: false,
-          reason: '此问卷需要登录才能填写',
-          requireLogin: true
+          reason: entryStatus.reasons[0] || '无法填写',
+          reasons: entryStatus.reasons,
+          requireLogin: isAuthIssue,
+          requireInvite: survey.settings?.accessMode === 'invite_only',
+          inviteInfo,
+          entryStatus
         }
       });
     }
@@ -367,7 +504,8 @@ exports.checkCanSubmit = async (req, res, next) => {
           reason: '您已经提交过此问卷',
           duplicate: true,
           mode: duplicateCheck.mode,
-          existingAt: duplicateCheck.existingAt
+          existingAt: duplicateCheck.existingAt,
+          entryStatus
         }
       });
     }
@@ -377,7 +515,8 @@ exports.checkCanSubmit = async (req, res, next) => {
       data: {
         canSubmit: true,
         surveyVersion: survey.version,
-        antiDuplicateMode: survey.antiDuplicate.mode
+        antiDuplicateMode: survey.antiDuplicate.mode,
+        entryStatus
       }
     });
   } catch (err) {
