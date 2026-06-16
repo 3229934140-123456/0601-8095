@@ -119,8 +119,9 @@ class StatisticsService {
 
     for (const answer of answers) {
       if (Array.isArray(answer.value)) {
-        selectionCounts.push(answer.value.length);
-        for (const value of answer.value) {
+        const uniqueValues = [...new Set(answer.value)];
+        selectionCounts.push(uniqueValues.length);
+        for (const value of uniqueValues) {
           if (distribution[value] !== undefined) {
             distribution[value]++;
           }

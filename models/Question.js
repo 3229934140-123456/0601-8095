@@ -121,6 +121,15 @@ MultipleChoiceQuestion.prototype._validateByType = function(answer) {
     return { valid: false, error: '多选题答案必须是数组格式' };
   }
   
+  const uniqueValues = new Set(answer);
+  if (uniqueValues.size !== answer.length) {
+    const duplicates = answer.filter((val, idx) => answer.indexOf(val) !== idx);
+    return { 
+      valid: false, 
+      error: `存在重复的选项值: ${[...new Set(duplicates)].join(', ')}` 
+    };
+  }
+  
   const validValues = this.config.options.map(opt => opt.value);
   const invalidValues = answer.filter(val => !validValues.includes(val));
   

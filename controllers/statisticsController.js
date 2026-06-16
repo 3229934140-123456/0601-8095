@@ -24,18 +24,66 @@ exports.getStatistics = async (req, res, next) => {
     }
     
     const targetVersion = version ? Number(version) : null;
-    const responses = await Response.getResponsesBySurveyVersion(surveyId, targetVersion);
+    const allResponses = await Response.getResponsesBySurveyVersion(surveyId, null);
+    const versionDistribution = await Response.getResponseCountByVersion(surveyId);
     
-    const statistics = await StatisticsService.calculateStatistics(
-      survey,
-      responses,
-      targetVersion
-    );
+    if (targetVersion !== null) {
+      const versionResponses = allResponses.filter(r => r.surveyVersion === targetVersion);
+      const statistics = await StatisticsService.calculateStatistics(
+        survey,
+        versionResponses,
+        targetVersion
+      );
+      
+      return res.json({
+        success: true,
+        data: {
+          mode: 'single_version',
+          statistics
+        }
+      });
+    }
+    
+    const versionStats = [];
+    const versionsWithResponses = new Set(versionDistribution.map(v => v._id));
+    versionsWithResponses.add(survey.version);
+    
+    for (const v of [...versionsWithResponses].sort((a, b) => b - a)) {
+      const versionResponses = allResponses.filter(r => r.surveyVersion === v);
+      if (versionResponses.length === 0 && v !== survey.version) continue;
+      
+      const stats = await StatisticsService.calculateStatistics(
+        survey,
+        versionResponses,
+        v
+      );
+      
+      const versionInfo = v === survey.version 
+        ? { version: v, isCurrent: true, title: survey.title, description: survey.description, createdAt: survey.updatedAt }
+        : survey.history.find(h => h.version === v) || { version: v, isCurrent: false, title: `版本 ${v}`, description: '', createdAt: null };
+      
+      versionStats.push({
+        version: v,
+        isCurrent: v === survey.version,
+        title: versionInfo.title,
+        description: versionInfo.description,
+        createdAt: versionInfo.createdAt,
+        responseCount: versionResponses.length,
+        statistics: stats
+      });
+    }
     
     res.json({
       success: true,
       data: {
-        statistics
+        mode: 'all_versions',
+        currentVersion: survey.version,
+        versionDistribution,
+        versions: versionStats,
+        summary: {
+          totalResponses: allResponses.length,
+          totalVersions: versionStats.length
+        }
       }
     });
   } catch (err) {

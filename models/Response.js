@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
 const answerSchema = new mongoose.Schema({
@@ -11,6 +12,17 @@ const answerSchema = new mongoose.Schema({
     required: true
   },
   questionType: {
+    type: String,
+    required: true
+  }
+}, { _id: false });
+
+const antiDuplicateKeySchema = new mongoose.Schema({
+  mode: {
+    type: String,
+    required: true
+  },
+  key: {
     type: String,
     required: true
   }
@@ -42,6 +54,10 @@ const responseSchema = new mongoose.Schema({
     userAgent: { type: String, default: null },
     fingerprint: { type: String, default: null, index: true }
   },
+  antiDuplicateKeys: {
+    type: [antiDuplicateKeySchema],
+    default: []
+  },
   metadata: {
     startTime: { type: Date },
     endTime: { type: Date },
@@ -60,64 +76,87 @@ responseSchema.index({ surveyId: 1, 'respondent.deviceId': 1 }, { sparse: true }
 responseSchema.index({ surveyId: 1, 'respondent.fingerprint': 1 }, { sparse: true });
 responseSchema.index({ createdAt: -1 });
 
-responseSchema.statics.checkDuplicate = async function(surveyId, respondent, mode, expiryHours = 24) {
-  const expiryDate = new Date(Date.now() - expiryHours * 60 * 60 * 1000);
+responseSchema.index(
+  { 'antiDuplicateKeys.mode': 1, 'antiDuplicateKeys.key': 1 },
+  { unique: true, sparse: true, name: 'anti_duplicate_unique' }
+);
+
+responseSchema.statics.generateAntiDuplicateKeys = function(surveyId, respondent, mode, expiryHours = 24) {
+  const keys = [];
+  const expiryBucket = Math.floor(Date.now() / (expiryHours * 3600 * 1000));
   
-  const baseQuery = {
-    surveyId,
-    createdAt: { $gte: expiryDate }
+  const makeKey = (...parts) => {
+    return crypto.createHash('sha256').update(parts.join('|')).digest('hex');
   };
-  
-  let query = { ...baseQuery };
   
   switch (mode) {
     case 'by_user':
-      if (!respondent.userId) {
-        return { isDuplicate: false, reason: 'no_user_id' };
+      if (respondent.userId) {
+        const key = makeKey('by_user', surveyId, String(expiryBucket), respondent.userId);
+        keys.push({ mode: 'by_user', key });
       }
-      query['respondent.userId'] = respondent.userId;
       break;
       
     case 'by_ip':
-      query['respondent.ipAddress'] = respondent.ipAddress;
+      if (respondent.ipAddress) {
+        const key = makeKey('by_ip', surveyId, String(expiryBucket), respondent.ipAddress);
+        keys.push({ mode: 'by_ip', key });
+      }
       break;
       
     case 'by_device':
-      if (!respondent.deviceId && !respondent.fingerprint) {
-        return { isDuplicate: false, reason: 'no_device_identifier' };
-      }
-      query.$or = [];
       if (respondent.deviceId) {
-        query.$or.push({ 'respondent.deviceId': respondent.deviceId });
+        const key = makeKey('by_device', surveyId, String(expiryBucket), respondent.deviceId);
+        keys.push({ mode: 'by_device', key });
       }
       if (respondent.fingerprint) {
-        query.$or.push({ 'respondent.fingerprint': respondent.fingerprint });
+        const key = makeKey('by_fp', surveyId, String(expiryBucket), respondent.fingerprint);
+        keys.push({ mode: 'by_fp', key });
       }
       break;
       
     case 'by_user_ip_device':
-      query.$or = [];
       if (respondent.userId) {
-        query.$or.push({ 'respondent.userId': respondent.userId });
+        const key = makeKey('by_user', surveyId, String(expiryBucket), respondent.userId);
+        keys.push({ mode: 'by_user', key });
       }
-      query.$or.push({ 'respondent.ipAddress': respondent.ipAddress });
+      if (respondent.ipAddress) {
+        const key = makeKey('by_ip', surveyId, String(expiryBucket), respondent.ipAddress);
+        keys.push({ mode: 'by_ip', key });
+      }
       if (respondent.deviceId) {
-        query.$or.push({ 'respondent.deviceId': respondent.deviceId });
+        const key = makeKey('by_device', surveyId, String(expiryBucket), respondent.deviceId);
+        keys.push({ mode: 'by_device', key });
       }
       if (respondent.fingerprint) {
-        query.$or.push({ 'respondent.fingerprint': respondent.fingerprint });
-      }
-      if (query.$or.length === 0) {
-        query = { 'respondent.ipAddress': respondent.ipAddress };
+        const key = makeKey('by_fp', surveyId, String(expiryBucket), respondent.fingerprint);
+        keys.push({ mode: 'by_fp', key });
       }
       break;
       
     case 'none':
     default:
-      return { isDuplicate: false };
+      break;
   }
   
-  const existing = await this.findOne(query).select('id createdAt').lean();
+  return keys;
+};
+
+responseSchema.statics.checkDuplicate = async function(surveyId, respondent, mode, expiryHours = 24) {
+  const antiDuplicateKeys = this.generateAntiDuplicateKeys(surveyId, respondent, mode, expiryHours);
+  
+  if (antiDuplicateKeys.length === 0) {
+    return { isDuplicate: false, reason: 'no_anti_duplicate_keys' };
+  }
+  
+  const duplicateQuery = antiDuplicateKeys.map(k => ({ 
+    'antiDuplicateKeys': { $elemMatch: { mode: k.mode, key: k.key } } 
+  }));
+  
+  const existing = await this.findOne({
+    surveyId,
+    $or: duplicateQuery
+  }).select('id createdAt').lean();
   
   if (existing) {
     return {
@@ -152,6 +191,58 @@ responseSchema.statics.getResponseCountByVersion = async function(surveyId) {
     }},
     { $sort: { _id: 1 } }
   ]);
+};
+
+responseSchema.statics.createWithAntiDuplicate = async function(responseData, surveyId, respondent, mode, expiryHours) {
+  const antiDuplicateKeys = this.generateAntiDuplicateKeys(surveyId, respondent, mode, expiryHours);
+  
+  responseData.antiDuplicateKeys = antiDuplicateKeys;
+  
+  const saved = new this(responseData);
+  
+  try {
+    const session = await this.startSession();
+    
+    try {
+      await session.withTransaction(async () => {
+        await saved.save({ session });
+        
+        if (antiDuplicateKeys.length > 0) {
+          for (const key of antiDuplicateKeys) {
+            const existing = await this.findOne({
+              surveyId,
+              'antiDuplicateKeys': { $elemMatch: { mode: key.mode, key: key.key } },
+              _id: { $ne: saved._id }
+            }).session(session);
+            
+            if (existing) {
+              throw new Error('DUPLICATE_RESPONSE');
+            }
+          }
+        }
+      });
+    } finally {
+      session.endSession();
+    }
+    
+    return { success: true, response: saved };
+  } catch (err) {
+    if (err.message === 'DUPLICATE_RESPONSE' || err.code === 11000) {
+      const existing = await this.findOne({
+        surveyId,
+        $or: antiDuplicateKeys.map(k => ({
+          'antiDuplicateKeys': { $elemMatch: { mode: k.mode, key: k.key } }
+        }))
+      }).select('id createdAt').lean();
+      
+      return {
+        success: false,
+        isDuplicate: true,
+        existing
+      };
+    }
+    throw err;
+  }
 };
 
 const Response = mongoose.model('Response', responseSchema);

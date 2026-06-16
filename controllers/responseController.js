@@ -48,21 +48,21 @@ exports.submitResponse = async (req, res, next) => {
       fingerprint: fingerprint || null
     };
     
-    const duplicateCheck = await Response.checkDuplicate(
+    const preCheck = await Response.checkDuplicate(
       surveyId,
       respondent,
       survey.antiDuplicate.mode,
       survey.antiDuplicate.cookieExpiryHours
     );
     
-    if (duplicateCheck.isDuplicate) {
+    if (preCheck.isDuplicate) {
       return res.status(409).json({
         success: false,
         message: '您已经提交过此问卷',
         data: {
           duplicate: true,
-          mode: duplicateCheck.mode,
-          existingAt: duplicateCheck.existingAt
+          mode: preCheck.mode,
+          existingAt: preCheck.existingAt
         }
       });
     }
@@ -88,22 +88,44 @@ exports.submitResponse = async (req, res, next) => {
       questionType: questionMap[answer.questionId]?.type || 'unknown'
     }));
     
-    const response = new Response({
+    const responseData = {
       surveyId,
       surveyVersion: survey.version,
       answers: formattedAnswers,
       respondent,
       metadata: metadata || {}
-    });
+    };
     
     if (metadata?.startTime) {
       const startTime = new Date(metadata.startTime);
       const endTime = new Date();
-      response.metadata.endTime = endTime;
-      response.metadata.completionTime = Math.round((endTime - startTime) / 1000);
+      responseData.metadata.endTime = endTime;
+      responseData.metadata.completionTime = Math.round((endTime - startTime) / 1000);
     }
     
-    await response.save();
+    const createResult = await Response.createWithAntiDuplicate(
+      responseData,
+      surveyId,
+      respondent,
+      survey.antiDuplicate.mode,
+      survey.antiDuplicate.cookieExpiryHours
+    );
+    
+    if (!createResult.success && createResult.isDuplicate) {
+      return res.status(409).json({
+        success: false,
+        message: '您已经提交过此问卷',
+        data: {
+          duplicate: true,
+          mode: survey.antiDuplicate.mode,
+          existingAt: createResult.existing?.createdAt
+        }
+      });
+    }
+    
+    if (!createResult.success) {
+      throw new Error('保存回答失败');
+    }
     
     survey.responseCount += 1;
     await survey.save();
@@ -112,9 +134,9 @@ exports.submitResponse = async (req, res, next) => {
       success: true,
       message: '提交成功',
       data: {
-        responseId: response.id,
-        surveyVersion: response.surveyVersion,
-        submittedAt: response.createdAt
+        responseId: createResult.response.id,
+        surveyVersion: createResult.response.surveyVersion,
+        submittedAt: createResult.response.createdAt
       }
     });
   } catch (err) {

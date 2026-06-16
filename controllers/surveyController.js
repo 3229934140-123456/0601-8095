@@ -321,7 +321,7 @@ exports.getSurveyVersions = async (req, res, next) => {
   try {
     const { id } = req.params;
     
-    const survey = await Survey.findOne({ id }).select('id version history');
+    const survey = await Survey.findOne({ id }).select('id version history title description updatedAt createdBy');
     
     if (!survey) {
       return res.status(404).json({
