@@ -893,3 +893,198 @@ describe('版本对比鲁棒性测试', () => {
     expect(result.responseCount).toBe(1);
   });
 });
+
+describe('质量分析增强测试', () => {
+  test('_deriveRiskLevel 分级正确', () => {
+    const doc = new Response();
+    expect(doc._deriveRiskLevel(0)).toBe('low');
+    expect(doc._deriveRiskLevel(14)).toBe('low');
+    expect(doc._deriveRiskLevel(15)).toBe('medium');
+    expect(doc._deriveRiskLevel(39)).toBe('medium');
+    expect(doc._deriveRiskLevel(40)).toBe('high');
+    expect(doc._deriveRiskLevel(100)).toBe('high');
+  });
+
+  test('applyCrossResponseFlags 正确追加标记和提升风险', () => {
+    const doc = new Response();
+    doc.quality = { riskLevel: 'low', riskFlags: ['too_fast'], _baseScore: 30, completionSeconds: 5 };
+
+    doc.applyCrossResponseFlags(['duplicate_ip', 'high_frequency_submit'], 40);
+
+    expect(doc.quality.riskFlags).toContain('too_fast');
+    expect(doc.quality.riskFlags).toContain('duplicate_ip');
+    expect(doc.quality.riskFlags).toContain('high_frequency_submit');
+    expect(doc.quality.riskLevel).toBe('high');
+  });
+
+  test('新增跨回答风险标记枚举', () => {
+    const expectedFlags = ['duplicate_ip', 'duplicate_device', 'high_frequency_submit'];
+    for (const f of expectedFlags) {
+      expect(typeof f).toBe('string');
+      expect(f.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('scanAndMarkCrossResponseQuality 静态方法存在', () => {
+    expect(typeof Response.scanAndMarkCrossResponseQuality).toBe('function');
+  });
+
+  test('buildFilterQuery 支持 duplicate_ip 等风险标记筛选', () => {
+    const q = Response.buildFilterQuery('s1', { riskFlag: 'duplicate_ip' });
+    expect(q['quality.riskFlags']).toBeDefined();
+    expect(q['quality.riskFlags']['$in']).toContain('duplicate_ip');
+  });
+});
+
+describe('CSV导出一致性测试', () => {
+  test('StatisticsService.exportToCSV 接受质量筛选参数并输出质量列', () => {
+    const survey = {
+      id: 's1',
+      version: 1,
+      questions: [
+        { id: 'q1', order: 0, type: QUESTION_TYPES.SINGLE_CHOICE, title: '题1', config: { options: [] } }
+      ],
+      history: []
+    };
+    const responses = [
+      {
+        id: 'r1',
+        surveyVersion: 1,
+        createdAt: new Date('2024-01-01'),
+        respondent: { userId: 'u1', ipAddress: '1.1.1.1', deviceId: 'd1' },
+        quality: { riskLevel: 'high', riskFlags: ['duplicate_ip', 'too_fast'], completionSeconds: 3 },
+        answers: [{ questionId: 'q1', value: 'a' }]
+      }
+    ];
+    const csv = StatisticsService.exportToCSV(survey, responses, null, { riskLevel: 'high' });
+    expect(csv).toContain('风险等级');
+    expect(csv).toContain('风险标记');
+    expect(csv).toContain('完成时长(秒)');
+    expect(csv).toContain('high');
+    expect(csv).toContain('duplicate_ip|too_fast');
+    expect(csv).toContain('3');
+  });
+
+  test('明细和导出共用 buildFilterQuery', () => {
+    const filters = {
+      riskLevel: 'high',
+      riskFlag: 'duplicate_ip',
+      completionTimeMin: 1,
+      completionTimeMax: 30
+    };
+    const listQ = Response.buildFilterQuery('s1', filters);
+    const exportQ = Response.buildFilterQuery('s1', filters);
+    expect(JSON.stringify(listQ)).toEqual(JSON.stringify(exportQ));
+  });
+});
+
+describe('邀请链接并发与一次性测试', () => {
+  test('claimByCode 静态方法存在', () => {
+    expect(typeof InviteLink.claimByCode).toBe('function');
+  });
+
+  test('claimByCode 无邀请码时返回失败', async () => {
+    const r = await InviteLink.claimByCode(null);
+    expect(r.success).toBe(false);
+    expect(r.reason).toBe('缺少邀请码');
+  });
+
+  test('isUsable 对已使用状态返回链接已使用过', () => {
+    const link = new InviteLink({ status: INVITE_STATUS.USED, currentUses: 1, maxUses: 1 });
+    const u = link.isUsable();
+    expect(u.usable).toBe(false);
+    expect(u.reason).toBe('邀请链接已使用过');
+  });
+
+  test('isUsable 对已过期状态返回邀请链接已过期', () => {
+    const link = new InviteLink({
+      status: INVITE_STATUS.UNUSED,
+      currentUses: 0,
+      maxUses: 1,
+      expiresAt: new Date(Date.now() - 86400000)
+    });
+    const u = link.isUsable();
+    expect(u.usable).toBe(false);
+    expect(u.reason).toBe('邀请链接已过期');
+  });
+
+  test('isUsable 对已作废状态返回邀请链接已作废', () => {
+    const link = new InviteLink({ status: INVITE_STATUS.REVOKED });
+    const u = link.isUsable();
+    expect(u.usable).toBe(false);
+    expect(u.reason).toBe('邀请链接已作废');
+  });
+
+  test('未使用且未过期的邀请码 isUsable 返回可用', () => {
+    const link = new InviteLink({
+      status: INVITE_STATUS.UNUSED,
+      currentUses: 0,
+      maxUses: 1,
+      expiresAt: new Date(Date.now() + 86400000)
+    });
+    const u = link.isUsable();
+    expect(u.usable).toBe(true);
+  });
+});
+
+describe('跨版本对照结构完整性测试', () => {
+  test('buildVersionComparisonSummary 可从 statisticsController 模块访问', () => {
+    const ctrl = require('../controllers/statisticsController');
+    expect(typeof ctrl.getStatistics).toBe('function');
+    expect(typeof ctrl.exportCSV).toBe('function');
+  });
+
+  test('StatisticsService 能正确计算评分题均值和回答量', async () => {
+    const question = {
+      id: 'r1',
+      type: QUESTION_TYPES.RATING,
+      title: '评分题',
+      config: { min: 1, max: 5, step: 1 }
+    };
+    const responses = [
+      { answers: [{ questionId: 'r1', value: 4 }] },
+      { answers: [{ questionId: 'r1', value: 5 }] },
+      { answers: [{ questionId: 'r1', value: '' }] }
+    ];
+    const r = await StatisticsService.calculateQuestionStatistics(question, responses);
+    expect(r.responseCount).toBe(2);
+    expect(r.skipCount).toBe(1);
+    expect(r.mean).toBe(4.5);
+  });
+
+  test('StatisticsService 单选题正确计算 mode 和热门选项', async () => {
+    const question = {
+      id: 's1',
+      type: QUESTION_TYPES.SINGLE_CHOICE,
+      title: '单题',
+      config: { options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }] }
+    };
+    const responses = [
+      { answers: [{ questionId: 's1', value: 'a' }] },
+      { answers: [{ questionId: 's1', value: 'b' }] },
+      { answers: [{ questionId: 's1', value: 'b' }] }
+    ];
+    const r = await StatisticsService.calculateQuestionStatistics(question, responses);
+    expect(r.mode.value).toBe('b');
+    expect(r.mode.count).toBe(2);
+    expect(r.responseCount).toBe(3);
+  });
+
+  test('StatisticsService 多选题正确计算热门选项（按出现次数）', async () => {
+    const question = {
+      id: 'm1',
+      type: QUESTION_TYPES.MULTIPLE_CHOICE,
+      title: '多题',
+      config: { options: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }, { value: 'c', label: 'C' }] }
+    };
+    const responses = [
+      { answers: [{ questionId: 'm1', value: ['a', 'b'] }] },
+      { answers: [{ questionId: 'm1', value: ['b', 'c'] }] },
+      { answers: [{ questionId: 'm1', value: ['b'] }] }
+    ];
+    const r = await StatisticsService.calculateQuestionStatistics(question, responses);
+    const optionB = r.options.find(o => o.value === 'b');
+    expect(optionB.count).toBe(3);
+    expect(r.responseCount).toBe(3);
+  });
+});

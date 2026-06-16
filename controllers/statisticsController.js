@@ -96,21 +96,34 @@ exports.getStatistics = async (req, res, next) => {
 };
 
 function buildVersionComparisonSummary(versionStats, survey) {
+  const emptyPerVersion = {
+    version: 0,
+    isCurrent: false,
+    responseCount: 0,
+    hasResponses: false,
+    title: '',
+    createdAt: null,
+    questionCount: { total: 0, rating: 0, singleChoice: 0, multipleChoice: 0 },
+    ratingMeans: [],
+    topChoices: []
+  };
+
   const result = {
     perVersion: [],
     changes: [],
     currentRank: [],
+    questionChanges: { added: 0, removed: 0, titleChanged: 0, typeChanged: 0 },
     meta: {
       totalVersions: 0,
       hasMultipleVersions: false,
       hasEmptyVersions: false
     }
   };
-  
+
   if (!versionStats || versionStats.length === 0) {
     return result;
   }
-  
+
   const safeGet = (obj, path, defaultValue = null) => {
     try {
       return path.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : defaultValue), obj);
@@ -118,9 +131,9 @@ function buildVersionComparisonSummary(versionStats, survey) {
       return defaultValue;
     }
   };
-  
+
   const sortedVersions = [...versionStats].sort((a, b) => a.version - b.version);
-  
+
   const perVersion = sortedVersions.map(vs => {
     let questions = [];
     try {
@@ -130,9 +143,9 @@ function buildVersionComparisonSummary(versionStats, survey) {
     } catch (e) {
       questions = [];
     }
-    
-    const ratingQuestions = Array.isArray(questions) 
-      ? questions.filter(q => q && q.type === QUESTION_TYPES.RATING) 
+
+    const ratingQuestions = Array.isArray(questions)
+      ? questions.filter(q => q && q.type === QUESTION_TYPES.RATING)
       : [];
     const singleChoiceQuestions = Array.isArray(questions)
       ? questions.filter(q => q && q.type === QUESTION_TYPES.SINGLE_CHOICE)
@@ -140,49 +153,69 @@ function buildVersionComparisonSummary(versionStats, survey) {
     const multipleChoiceQuestions = Array.isArray(questions)
       ? questions.filter(q => q && q.type === QUESTION_TYPES.MULTIPLE_CHOICE)
       : [];
-    
-    const statsQuestions = Array.isArray(safeGet(vs, 'statistics.questions', []))
-      ? vs.statistics.questions
-      : [];
-    
+
+    const statsQuestionsRaw = safeGet(vs, 'statistics.questions', {});
+    const statsQuestions = statsQuestionsRaw && typeof statsQuestionsRaw === 'object' && !Array.isArray(statsQuestionsRaw)
+      ? Object.values(statsQuestionsRaw)
+      : (Array.isArray(statsQuestionsRaw) ? statsQuestionsRaw : []);
+
     const ratingMeans = ratingQuestions.map(q => {
       const qStats = statsQuestions.find(s => s && s.questionId === q.id);
-      const mean = safeGet(qStats, 'statistics.mean', null);
+      const mean = safeGet(qStats, 'mean', null);
+      const count = safeGet(qStats, 'responseCount', 0);
       return {
         questionId: q.id,
         title: q.title || `题目 ${q.id}`,
         order: q.order ?? 999,
         mean: typeof mean === 'number' ? mean : null,
-        responseCount: safeGet(qStats, 'responseCount', 0) || 0
+        responseCount: typeof count === 'number' ? count : 0
       };
     });
-    
-    const topChoices = singleChoiceQuestions.map(q => {
+
+    const buildTopChoice = (q) => {
       const qStats = statsQuestions.find(s => s && s.questionId === q.id);
-      const distribution = safeGet(qStats, 'statistics.distribution', {}) || {};
-      const options = safeGet(qStats, 'statistics.options', []) || [];
-      const mode = safeGet(qStats, 'statistics.mode', null);
-      
-      const counts = Object.values(distribution).filter(v => typeof v === 'number');
-      const maxCount = counts.length > 0 ? Math.max(...counts) : 0;
-      
+      const options = safeGet(qStats, 'options', []) || [];
+      const mode = safeGet(qStats, 'mode', null);
       const totalResponses = safeGet(qStats, 'responseCount', 0) || 0;
-      const topOption = mode ? options.find(o => o && o.value === mode.value) : null;
-      
+
+      let topOption = null;
+      let topCount = 0;
+      let topPercentage = 0;
+
+      if (mode && typeof mode === 'object') {
+        topOption = { value: mode.value, label: mode.label };
+        topCount = typeof mode.count === 'number' ? mode.count : 0;
+        if (totalResponses > 0) {
+          topPercentage = Math.round((topCount / totalResponses) * 10000) / 100;
+        }
+      } else if (options.length > 0) {
+        const sorted = [...options].sort((a, b) => (b.count || 0) - (a.count || 0));
+        if (sorted[0]) {
+          topOption = { value: sorted[0].value, label: sorted[0].label };
+          topCount = sorted[0].count || 0;
+          topPercentage = sorted[0].percentage || 0;
+        }
+      }
+
       return {
         questionId: q.id,
         title: q.title || `题目 ${q.id}`,
         order: q.order ?? 999,
-        topOptionValue: mode?.value ?? null,
-        topOptionLabel: mode?.label ?? (topOption?.label ?? null),
-        topOptionCount: maxCount,
-        topOptionPercentage: topOption?.percentage ?? 0,
+        questionType: q.type,
+        topOptionValue: topOption ? topOption.value : null,
+        topOptionLabel: topOption ? topOption.label : null,
+        topOptionCount: topCount,
+        topOptionPercentage,
         responseCount: totalResponses
       };
-    });
-    
+    };
+
+    const topSingleChoices = singleChoiceQuestions.map(buildTopChoice);
+    const topMultipleChoices = multipleChoiceQuestions.map(buildTopChoice);
+    const topChoices = [...topSingleChoices, ...topMultipleChoices].sort((a, b) => (a.order ?? 999) - (b.order ?? 999));
+
     const hasResponses = (vs.responseCount || 0) > 0;
-    
+
     return {
       version: vs.version,
       isCurrent: !!vs.isCurrent,
@@ -200,16 +233,16 @@ function buildVersionComparisonSummary(versionStats, survey) {
       topChoices
     };
   });
-  
+
   const changes = [];
-  
+
   for (let i = 1; i < perVersion.length; i++) {
     const prev = perVersion[i - 1];
     const curr = perVersion[i];
-    
+
     const prevCount = prev.responseCount || 0;
     const currCount = curr.responseCount || 0;
-    
+
     const diff = {
       fromVersion: prev.version,
       fromTitle: prev.title,
@@ -219,7 +252,7 @@ function buildVersionComparisonSummary(versionStats, survey) {
         before: prevCount,
         after: currCount,
         delta: currCount - prevCount,
-        deltaPercent: prevCount > 0 
+        deltaPercent: prevCount > 0
           ? Math.round(((currCount - prevCount) / prevCount) * 10000) / 100
           : (currCount > 0 ? 100 : 0)
       },
@@ -232,28 +265,28 @@ function buildVersionComparisonSummary(versionStats, survey) {
       ratingMeanChanges: [],
       topChoiceChanges: []
     };
-    
+
     const prevQids = new Set([...prev.ratingMeans.map(r => r.questionId), ...prev.topChoices.map(t => t.questionId)]);
     const currQids = new Set([...curr.ratingMeans.map(r => r.questionId), ...curr.topChoices.map(t => t.questionId)]);
     const allQids = new Set([...prevQids, ...currQids]);
-    
+
     for (const qid of allQids) {
       const inPrev = prevQids.has(qid);
       const inCurr = currQids.has(qid);
       if (inPrev && !inCurr) diff.questionChanges.removed++;
       if (!inPrev && inCurr) diff.questionChanges.added++;
     }
-    
+
     for (const prevRating of prev.ratingMeans) {
       const currRating = curr.ratingMeans.find(r => r.questionId === prevRating.questionId);
       if (currRating) {
         if (prevRating.title !== currRating.title) {
           diff.questionChanges.titleChanged++;
         }
-        
+
         const prevMean = typeof prevRating.mean === 'number' ? prevRating.mean : null;
         const currMean = typeof currRating.mean === 'number' ? currRating.mean : null;
-        
+
         diff.ratingMeanChanges.push({
           questionId: prevRating.questionId,
           title: currRating.title,
@@ -262,18 +295,22 @@ function buildVersionComparisonSummary(versionStats, survey) {
           delta: (prevMean !== null && currMean !== null)
             ? Math.round((currMean - prevMean) * 100) / 100
             : null,
-          status: 'unchanged'
+          status: (prevMean === currMean || (prevMean === null && currMean === null)) ? 'unchanged' : 'changed'
         });
       }
     }
-    
+
     for (const prevChoice of prev.topChoices) {
       const currChoice = curr.topChoices.find(c => c.questionId === prevChoice.questionId);
       if (currChoice) {
+        if (prevChoice.title !== currChoice.title) diff.questionChanges.titleChanged++;
+        if (prevChoice.questionType !== currChoice.questionType) diff.questionChanges.typeChanged++;
+
         const changed = prevChoice.topOptionValue !== currChoice.topOptionValue;
         diff.topChoiceChanges.push({
           questionId: prevChoice.questionId,
           title: currChoice.title,
+          questionType: currChoice.questionType,
           changed,
           status: changed ? 'changed' : 'unchanged',
           before: {
@@ -293,10 +330,15 @@ function buildVersionComparisonSummary(versionStats, survey) {
         });
       }
     }
-    
+
     changes.push(diff);
   }
-  
+
+  const totalAdded = changes.reduce((s, c) => s + c.questionChanges.added, 0);
+  const totalRemoved = changes.reduce((s, c) => s + c.questionChanges.removed, 0);
+  const totalTitleChanged = changes.reduce((s, c) => s + c.questionChanges.titleChanged, 0);
+  const totalTypeChanged = changes.reduce((s, c) => s + c.questionChanges.typeChanged, 0);
+
   result.perVersion = perVersion;
   result.changes = changes;
   result.currentRank = perVersion
@@ -308,12 +350,18 @@ function buildVersionComparisonSummary(versionStats, survey) {
       title: vs.title,
       responseCount: vs.responseCount
     }));
+  result.questionChanges = {
+    added: totalAdded,
+    removed: totalRemoved,
+    titleChanged: totalTitleChanged,
+    typeChanged: totalTypeChanged
+  };
   result.meta = {
     totalVersions: perVersion.length,
     hasMultipleVersions: perVersion.length >= 2,
     hasEmptyVersions: perVersion.some(v => !v.hasResponses)
   };
-  
+
   return result;
 }
 
@@ -379,7 +427,12 @@ exports.exportCSV = async (req, res, next) => {
       deviceId,
       fingerprint,
       startDate,
-      endDate
+      endDate,
+      riskLevel,
+      riskFlag,
+      riskFlags,
+      completionTimeMin,
+      completionTimeMax
     } = req.query;
     
     const survey = await Survey.getFullSurvey(surveyId);
@@ -405,19 +458,26 @@ exports.exportCSV = async (req, res, next) => {
       deviceId: deviceId || null,
       fingerprint: fingerprint || null,
       startDate: startDate || null,
-      endDate: endDate || null
+      endDate: endDate || null,
+      riskLevel: riskLevel || null,
+      riskFlag: riskFlag || null,
+      riskFlags: riskFlags ? (Array.isArray(riskFlags) ? riskFlags : [riskFlags]) : null,
+      completionTimeMin: completionTimeMin !== undefined ? completionTimeMin : null,
+      completionTimeMax: completionTimeMax !== undefined ? completionTimeMax : null
     };
     
     const query = Response.buildFilterQuery(surveyId, filters);
     const responses = await Response.find(query).sort({ createdAt: -1 }).lean();
     
     const targetVersion = version ? Number(version) : null;
-    const csvContent = StatisticsService.exportToCSV(survey, responses, targetVersion);
+    const csvContent = StatisticsService.exportToCSV(survey, responses, targetVersion, filters);
     
     const filterSuffix = [
       version ? `v${version}` : null,
       userId ? `user-${userId}` : null,
-      ipAddress ? `ip-${ipAddress.replace(/\./g, '-')}` : null
+      ipAddress ? `ip-${ipAddress.replace(/\./g, '-')}` : null,
+      riskLevel ? `risk-${riskLevel}` : null,
+      riskFlag ? `flag-${riskFlag}` : null
     ].filter(Boolean).join('_');
     
     const filename = `survey-${surveyId}-${filterSuffix || 'filtered'}-${Date.now()}.csv`;

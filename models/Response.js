@@ -92,7 +92,10 @@ responseSchema.pre('save', function(next) {
     this.quality = { riskLevel: 'low', riskFlags: [], completionSeconds: null, answerConsistency: null };
   }
   
-  const flags = [];
+  const existingFlags = this.quality.riskFlags || [];
+  const flags = new Set(existingFlags.filter(f => 
+    f !== 'duplicate_ip' && f !== 'duplicate_device' && f !== 'high_frequency_submit'
+  ));
   let score = 0;
   const questionCount = this.answers?.length || 0;
   
@@ -105,22 +108,22 @@ responseSchema.pre('save', function(next) {
       if (questionCount > 0) {
         const perQuestionSeconds = completionSeconds / questionCount;
         if (perQuestionSeconds < 2) {
-          flags.push('too_fast');
+          flags.add('too_fast');
           score += 30;
         } else if (perQuestionSeconds < 5) {
-          flags.push('suspiciously_fast');
+          flags.add('suspiciously_fast');
           score += 10;
         }
       }
       
       if (completionSeconds < 5) {
-        flags.push('instant_submit');
+        flags.add('instant_submit');
         score += 20;
       }
     }
     
     if (completionSeconds > 3600) {
-      flags.push('too_slow');
+      flags.add('too_slow');
       score += 5;
     }
   }
@@ -146,14 +149,14 @@ responseSchema.pre('save', function(next) {
       a.questionType === 'SINGLE_CHOICE' || a.questionType === 'MULTIPLE_CHOICE'
     ).length;
     if (choiceCount > 3 && sameAnswerCount / choiceCount > 0.8) {
-      flags.push('straight_lining');
+      flags.add('straight_lining');
       score += 25;
     }
     
     if (textAnswerValues.length >= 2) {
       const uniqueTexts = new Set(textAnswerValues.map(t => t.trim().toLowerCase()));
       if (uniqueTexts.size === 1 && textAnswerValues[0].trim().length > 0) {
-        flags.push('duplicate_text_answers');
+        flags.add('duplicate_text_answers');
         score += 15;
       }
     }
@@ -165,23 +168,132 @@ responseSchema.pre('save', function(next) {
       (Array.isArray(a.value) && a.value.length === 0)
     ).length;
     if (skippedCount / this.answers.length > 0.5) {
-      flags.push('many_skipped');
+      flags.add('many_skipped');
       score += 10;
     }
   }
   
-  this.quality.riskFlags = flags;
-  
-  if (score >= 40) {
-    this.quality.riskLevel = 'high';
-  } else if (score >= 15) {
-    this.quality.riskLevel = 'medium';
-  } else {
-    this.quality.riskLevel = 'low';
-  }
+  this.quality.riskFlags = [...flags];
+  this.quality.riskLevel = this._deriveRiskLevel(score);
+  this.quality._baseScore = score;
   
   next();
 });
+
+responseSchema.methods._deriveRiskLevel = function(score) {
+  if (score >= 40) return 'high';
+  if (score >= 15) return 'medium';
+  return 'low';
+};
+
+responseSchema.methods.applyCrossResponseFlags = function(crossFlags, extraScore = 0) {
+  const currentFlags = new Set(this.quality?.riskFlags || []);
+  for (const f of crossFlags) {
+    currentFlags.add(f);
+  }
+  this.quality = this.quality || {};
+  this.quality.riskFlags = [...currentFlags];
+  const base = (this.quality._baseScore !== undefined) ? this.quality._baseScore : 0;
+  this.quality.riskLevel = this._deriveRiskLevel(base + extraScore);
+  return this;
+};
+
+responseSchema.statics.scanAndMarkCrossResponseQuality = async function(surveyId, options = {}) {
+  const {
+    duplicateIpThreshold = 1,
+    duplicateDeviceThreshold = 1,
+    highFrequencyWindowMs = 5 * 60 * 1000,
+    highFrequencyThreshold = 3
+  } = options;
+
+  const allResponses = await this.find({ surveyId }).sort({ createdAt: 1 }).lean();
+  if (allResponses.length === 0) {
+    return { updated: 0, flaggedIps: 0, flaggedDevices: 0, highFrequencyGroups: 0 };
+  }
+
+  const byIp = new Map();
+  const byDevice = new Map();
+  for (const r of allResponses) {
+    const ip = r.respondent?.ipAddress;
+    const dev = r.respondent?.deviceId;
+    if (ip) {
+      if (!byIp.has(ip)) byIp.set(ip, []);
+      byIp.get(ip).push(r);
+    }
+    if (dev) {
+      if (!byDevice.has(dev)) byDevice.set(dev, []);
+      byDevice.get(dev).push(r);
+    }
+  }
+
+  const responseIdToFlags = new Map();
+  const addFlag = (rid, flag, weight) => {
+    if (!responseIdToFlags.has(rid)) responseIdToFlags.set(rid, { flags: new Set(), score: 0 });
+    responseIdToFlags.get(rid).flags.add(flag);
+    responseIdToFlags.get(rid).score += weight;
+  };
+
+  let flaggedIps = 0, flaggedDevices = 0;
+
+  for (const [ip, list] of byIp.entries()) {
+    if (list.length > duplicateIpThreshold) {
+      flaggedIps++;
+      for (const r of list) addFlag(r.id, 'duplicate_ip', 15);
+    }
+  }
+
+  for (const [dev, list] of byDevice.entries()) {
+    if (list.length > duplicateDeviceThreshold) {
+      flaggedDevices++;
+      for (const r of list) addFlag(r.id, 'duplicate_device', 20);
+    }
+  }
+
+  let highFrequencyGroups = 0;
+  const allTimed = allResponses
+    .filter(r => r.respondent?.ipAddress || r.respondent?.deviceId)
+    .map(r => ({
+      id: r.id,
+      ts: new Date(r.createdAt).getTime(),
+      key: r.respondent?.deviceId || r.respondent?.ipAddress
+    }));
+
+  const byKey = new Map();
+  for (const t of allTimed) {
+    if (!byKey.has(t.key)) byKey.set(t.key, []);
+    byKey.get(t.key).push(t);
+  }
+
+  for (const arr of byKey.values()) {
+    arr.sort((a, b) => a.ts - b.ts);
+    for (let i = 0; i < arr.length; i++) {
+      let j = i;
+      const windowItems = [];
+      while (j < arr.length && arr[j].ts - arr[i].ts <= highFrequencyWindowMs) {
+        windowItems.push(arr[j]);
+        j++;
+      }
+      if (windowItems.length >= highFrequencyThreshold) {
+        highFrequencyGroups++;
+        for (const t of windowItems) {
+          addFlag(t.id, 'high_frequency_submit', 25);
+        }
+        break;
+      }
+    }
+  }
+
+  let updated = 0;
+  for (const [rid, info] of responseIdToFlags.entries()) {
+    const doc = await this.findOne({ id: rid });
+    if (!doc) continue;
+    doc.applyCrossResponseFlags([...info.flags], info.score);
+    await doc.save();
+    updated++;
+  }
+
+  return { updated, flaggedIps, flaggedDevices, highFrequencyGroups };
+};
 
 responseSchema.statics.analyzeResponsesQuality = async function(surveyId, filters = {}) {
   const query = this.buildFilterQuery(surveyId, filters);

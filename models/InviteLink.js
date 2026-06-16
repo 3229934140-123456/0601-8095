@@ -92,6 +92,54 @@ inviteLinkSchema.methods.isUsable = function() {
   return { usable: true };
 };
 
+inviteLinkSchema.statics.claimByCode = async function(code, respondent = {}, responseId = null) {
+  if (!code) {
+    return { success: false, reason: '缺少邀请码' };
+  }
+
+  const normalizedCode = String(code).toUpperCase();
+  const now = new Date();
+
+  const result = await this.findOneAndUpdate(
+    {
+      code: normalizedCode,
+      status: INVITE_STATUS.UNUSED,
+      $expr: { $lt: ['$currentUses', '$maxUses'] },
+      $or: [
+        { expiresAt: null },
+        { expiresAt: { $gt: now } }
+      ]
+    },
+    {
+      $inc: { currentUses: 1 },
+      $set: {
+        usedAt: now,
+        'usedBy.userId': respondent.userId || null,
+        'usedBy.ipAddress': respondent.ipAddress || null,
+        'usedBy.deviceId': respondent.deviceId || null,
+        ...(responseId ? { responseId } : {})
+      }
+    },
+    { new: true }
+  );
+
+  if (result) {
+    if (result.currentUses >= result.maxUses) {
+      await this.updateOne({ _id: result._id }, { $set: { status: INVITE_STATUS.USED } });
+      result.status = INVITE_STATUS.USED;
+    }
+    return { success: true, invite: result };
+  }
+
+  const existing = await this.getByCode(normalizedCode);
+  if (!existing) {
+    return { success: false, reason: '邀请码无效' };
+  }
+
+  const usability = existing.isUsable();
+  return { success: false, reason: usability.reason, invite: existing };
+};
+
 inviteLinkSchema.methods.markUsed = async function(respondent, responseId) {
   this.currentUses += 1;
   this.usedAt = new Date();

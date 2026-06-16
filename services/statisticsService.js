@@ -300,7 +300,7 @@ class StatisticsService {
     };
   }
 
-  static exportToCSV(survey, responses, version = null) {
+  static exportToCSV(survey, responses, version = null, filters = null) {
     const allVersions = version 
       ? [Number(version)] 
       : [...new Set(responses.map(r => r.surveyVersion))].sort();
@@ -337,6 +337,9 @@ class StatisticsService {
       '用户ID', 
       'IP地址', 
       '设备ID',
+      '风险等级',
+      '风险标记',
+      '完成时长(秒)',
       ...sortedQuestionIds.map(qid => {
         const q = questionMeta[qid];
         return q ? `${q.title} (${qid})` : `题目 ${qid}`;
@@ -358,6 +361,9 @@ class StatisticsService {
         response.respondent?.userId || '匿名',
         response.respondent?.ipAddress || '',
         response.respondent?.deviceId || '',
+        response.quality?.riskLevel || 'low',
+        (response.quality?.riskFlags || []).join('|'),
+        response.quality?.completionSeconds ?? '',
         ...sortedQuestionIds.map(qid => getAnswerValue(response, qid))
       ];
       return row;

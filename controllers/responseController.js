@@ -55,6 +55,14 @@ exports.submitResponse = async (req, res, next) => {
       });
     }
     
+    const respondent = {
+      userId: req.user?.id || null,
+      ipAddress: getClientIp(req),
+      deviceId: deviceId || null,
+      userAgent: req.headers['user-agent'] || null,
+      fingerprint: fingerprint || null
+    };
+    
     let invite = null;
     if (survey.settings?.accessMode === 'invite_only') {
       if (!inviteCode) {
@@ -65,32 +73,20 @@ exports.submitResponse = async (req, res, next) => {
         });
       }
       
-      invite = await InviteLink.getByCode(inviteCode);
-      if (!invite || invite.surveyId !== survey.id) {
+      const claimResult = await InviteLink.claimByCode(inviteCode, respondent);
+      if (!claimResult.success) {
         return res.status(400).json({
           success: false,
-          message: '邀请码无效',
-          data: { canFill: false, invalidInvite: true }
+          message: claimResult.reason || '邀请码无效',
+          data: { 
+            canFill: false, 
+            invalidInvite: true,
+            inviteStatus: claimResult.invite?.status || null
+          }
         });
       }
-      
-      const usability = invite.isUsable();
-      if (!usability.usable) {
-        return res.status(400).json({
-          success: false,
-          message: usability.reason,
-          data: { canFill: false, inviteStatus: invite.status }
-        });
-      }
+      invite = claimResult.invite;
     }
-    
-    const respondent = {
-      userId: req.user?.id || null,
-      ipAddress: getClientIp(req),
-      deviceId: deviceId || null,
-      userAgent: req.headers['user-agent'] || null,
-      fingerprint: fingerprint || null
-    };
     
     const preCheck = await Response.checkDuplicate(
       surveyId,
@@ -156,6 +152,20 @@ exports.submitResponse = async (req, res, next) => {
     );
     
     if (!createResult.success && createResult.isDuplicate) {
+      if (invite) {
+        try {
+          await InviteLink.updateOne(
+            { id: invite.id },
+            {
+              $set: { status: 'unused', usedBy: { userId: null, ipAddress: null, deviceId: null } },
+              $inc: { currentUses: -1 },
+              $unset: { usedAt: '', responseId: '' }
+            }
+          );
+        } catch (e) {
+          console.warn('回滚邀请码状态失败:', e.message);
+        }
+      }
       return res.status(409).json({
         success: false,
         message: '您已经提交过此问卷',
@@ -168,6 +178,20 @@ exports.submitResponse = async (req, res, next) => {
     }
     
     if (!createResult.success) {
+      if (invite) {
+        try {
+          await InviteLink.updateOne(
+            { id: invite.id },
+            {
+              $set: { status: 'unused', usedBy: { userId: null, ipAddress: null, deviceId: null } },
+              $inc: { currentUses: -1 },
+              $unset: { usedAt: '', responseId: '' }
+            }
+          );
+        } catch (e) {
+          console.warn('回滚邀请码状态失败:', e.message);
+        }
+      }
       throw new Error('保存回答失败');
     }
     
@@ -176,10 +200,24 @@ exports.submitResponse = async (req, res, next) => {
     
     if (invite) {
       try {
-        await invite.markUsed(respondent, createResult.response.id);
+        await InviteLink.updateOne(
+          { id: invite.id },
+          { $set: { responseId: createResult.response.id } }
+        );
       } catch (e) {
-        console.warn('标记邀请码使用失败:', e.message);
+        console.warn('更新邀请码 responseId 失败:', e.message);
       }
+    }
+    
+    try {
+      await Response.scanAndMarkCrossResponseQuality(surveyId, {
+        duplicateIpThreshold: 1,
+        duplicateDeviceThreshold: 1,
+        highFrequencyWindowMs: 5 * 60 * 1000,
+        highFrequencyThreshold: 3
+      });
+    } catch (e) {
+      console.warn('跨回答质量扫描失败:', e.message);
     }
     
     res.status(201).json({
@@ -207,6 +245,11 @@ exports.getResponses = async (req, res, next) => {
       fingerprint,
       startDate,
       endDate,
+      riskLevel,
+      riskFlag,
+      riskFlags,
+      completionTimeMin,
+      completionTimeMax,
       page = 1, 
       limit = 50 
     } = req.query;
@@ -234,7 +277,12 @@ exports.getResponses = async (req, res, next) => {
       deviceId: deviceId || null,
       fingerprint: fingerprint || null,
       startDate: startDate || null,
-      endDate: endDate || null
+      endDate: endDate || null,
+      riskLevel: riskLevel || null,
+      riskFlag: riskFlag || null,
+      riskFlags: riskFlags ? (Array.isArray(riskFlags) ? riskFlags : [riskFlags]) : null,
+      completionTimeMin: completionTimeMin !== undefined ? completionTimeMin : null,
+      completionTimeMax: completionTimeMax !== undefined ? completionTimeMax : null
     };
     
     const result = await Response.getFilteredResponses(
